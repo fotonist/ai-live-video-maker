@@ -19,14 +19,36 @@ def _section_name(section: dict[str, Any]) -> str:
     return str(section.get("name") or section.get("label") or "section").lower()
 
 
-def _energy_for(scene_start: float, energy_curve: list[dict[str, Any]]) -> float:
+def _energy_for(scene_start: float, energy_curve: list[Any]) -> float:
+    """Return the energy value nearest to the scene start.
+
+    The current audio-analysis API stores energy_curve as a list of normalized
+    float values sampled every 0.5 seconds. Older/future analysis payloads may
+    use objects such as {"time": ..., "energy": ...}. Support both shapes so
+    storyboard generation remains compatible with persisted analysis records.
+    """
     if not energy_curve:
         return 0.5
-    nearest = min(
-        energy_curve,
-        key=lambda point: abs(float(point.get("time", 0.0)) - scene_start),
-    )
-    return max(0.0, min(1.0, float(nearest.get("energy", 0.5))))
+
+    first = energy_curve[0]
+
+    if isinstance(first, dict):
+        nearest = min(
+            energy_curve,
+            key=lambda point: abs(float(point.get("time", 0.0)) - scene_start),
+        )
+        value = nearest.get("energy", 0.5)
+    else:
+        index = min(
+            max(int(round(scene_start / 0.5)), 0),
+            len(energy_curve) - 1,
+        )
+        value = energy_curve[index]
+
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.5
 
 
 def plan_scenes(
