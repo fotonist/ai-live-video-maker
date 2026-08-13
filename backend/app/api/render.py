@@ -76,6 +76,7 @@ def _validate_video(ffmpeg: str, video_path: Path) -> None:
         )
 
 
+@router.post("/{project_id}/render", response_model=RenderResponse)
 def render_project(
     project_id: UUID,
     output_format: str = "9:16",
