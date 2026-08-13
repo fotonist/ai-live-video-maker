@@ -2,6 +2,8 @@
 
 import { ChangeEvent, FormEvent, useState } from "react";
 
+const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
+
 export default function HomePage() {
   const [projectName, setProjectName] = useState("");
   const [lyrics, setLyrics] = useState("");
@@ -58,26 +60,32 @@ export default function HomePage() {
       }
 
       setProjectId(data.id);
-      setStatusMessage(`Project created as ${data.status}.`);
 
-      if (audioFile) {
-        setStatusMessage("Project created. Uploading audio...");
-
-        const uploadForm = new FormData();
-        uploadForm.append("file", audioFile, audioFile.name);
-
-        const uploadResponse = await fetch(`/api/projects/${data.id}/audio`, {
-          method: "POST",
-          body: uploadForm,
-        });
-
-        const uploadData = await uploadResponse.json().catch(() => null);
-        if (!uploadResponse.ok) {
-          throw new Error(uploadData?.detail ?? "Audio upload failed.");
-        }
-
-        setStatusMessage(`Project created and audio uploaded (${uploadData.filename}).`);
+      if (!audioFile) {
+        setStatusMessage(`Project created as ${data.status}.`);
+        return;
       }
+
+      if (!backendUrl) {
+        throw new Error("NEXT_PUBLIC_BACKEND_URL is not configured.");
+      }
+
+      setStatusMessage("Project created. Uploading audio directly to the application API...");
+
+      const uploadForm = new FormData();
+      uploadForm.append("file", audioFile, audioFile.name);
+
+      const uploadResponse = await fetch(`${backendUrl.replace(/\/$/, "")}/projects/${data.id}/audio`, {
+        method: "POST",
+        body: uploadForm,
+      });
+
+      const uploadData = await uploadResponse.json().catch(() => null);
+      if (!uploadResponse.ok) {
+        throw new Error(uploadData?.detail ?? "Audio upload failed.");
+      }
+
+      setStatusMessage(`Project created and audio uploaded (${uploadData.filename}).`);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Project creation failed.");
     } finally {
