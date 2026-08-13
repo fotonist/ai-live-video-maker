@@ -79,6 +79,8 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
 
         # Render one video frame per second. The source is a static color frame,
         # so this keeps CPU/RAM usage substantially lower than 24/30 fps rendering.
+        # IMPORTANT: the temporary filename ends in .part, so explicitly specify
+        # the MP4 muxer with -f mp4. Otherwise FFmpeg cannot infer the container.
         command = [
             ffmpeg,
             "-y",
@@ -116,6 +118,8 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
             "96k",
             "-movflags",
             "+faststart",
+            "-f",
+            "mp4",
             str(temp_video_path),
         ]
 
@@ -129,8 +133,6 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
         if not temp_video_path.exists() or temp_video_path.stat().st_size == 0:
             raise RuntimeError("FFmpeg completed without producing a valid MP4")
 
-        # Do not run a second full FFmpeg validation pass here. It doubles I/O
-        # and decoding work and is unnecessary after a successful encode.
         temp_video_path.replace(video_path)
 
         project.status = "rendered"
