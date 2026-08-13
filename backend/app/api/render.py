@@ -48,7 +48,7 @@ def _dimensions(output_format: str) -> tuple[int, int]:
 
 
 def _validate_video(ffmpeg: str, video_path: Path) -> None:
-    """Run FFmpeg against the completed file to ensure the MP4 is readable."""
+    """Validate the MP4 container without decoding every video frame."""
     validation = run(
         [
             ffmpeg,
@@ -56,6 +56,10 @@ def _validate_video(ffmpeg: str, video_path: Path) -> None:
             "error",
             "-i",
             str(video_path),
+            "-map",
+            "0",
+            "-c",
+            "copy",
             "-f",
             "null",
             "-",
@@ -167,8 +171,7 @@ def render_project(
             detail="Video render failed: generated MP4 is empty",
         )
 
-    # Do not mark the project as rendered until the resulting MP4
-    # has been reopened successfully by FFmpeg.
+    # Validate the completed container without re-encoding/decoding it.
     _validate_video(ffmpeg, video_path)
 
     project.status = "rendered"
