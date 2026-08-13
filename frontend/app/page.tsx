@@ -2,8 +2,6 @@
 
 import { ChangeEvent, FormEvent, useState } from "react";
 
-const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
-
 export default function HomePage() {
   const [projectName, setProjectName] = useState("");
   const [lyrics, setLyrics] = useState("");
@@ -66,16 +64,12 @@ export default function HomePage() {
         return;
       }
 
-      if (!backendUrl) {
-        throw new Error("NEXT_PUBLIC_BACKEND_URL is not configured.");
-      }
-
-      setStatusMessage("Project created. Uploading audio directly to the application API...");
+      setStatusMessage("Project created. Uploading audio through the application API...");
 
       const uploadForm = new FormData();
       uploadForm.append("file", audioFile, audioFile.name);
 
-      const uploadResponse = await fetch(`${backendUrl.replace(/\/$/, "")}/projects/${data.id}/audio`, {
+      const uploadResponse = await fetch(`/api/projects/${data.id}/audio`, {
         method: "POST",
         body: uploadForm,
       });
