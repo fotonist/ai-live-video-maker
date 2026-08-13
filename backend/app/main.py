@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.projects import router as projects_router
+from app.api.render import router as render_router
 from app.api.storyboard import router as storyboard_router
 from app.db import get_engine
 from app.models import Base
@@ -38,6 +39,7 @@ app.add_middleware(
 
 app.include_router(projects_router)
 app.include_router(storyboard_router)
+app.include_router(render_router)
 
 
 @app.on_event("startup")
