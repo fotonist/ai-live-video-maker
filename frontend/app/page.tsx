@@ -14,7 +14,22 @@ export default function HomePage() {
   const [error, setError] = useState("");
 
   function handleAudioChange(event: ChangeEvent<HTMLInputElement>) {
-    setAudioFile(event.target.files?.[0] ?? null);
+    const file = event.target.files?.[0] ?? null;
+
+    if (file && !file.type.startsWith("audio/")) {
+      setAudioFile(null);
+      setError("Please select an MP3 or WAV audio file.");
+      return;
+    }
+
+    if (file && file.size > 100 * 1024 * 1024) {
+      setAudioFile(null);
+      setError("Audio files must be 100 MB or smaller.");
+      return;
+    }
+
+    setError("");
+    setAudioFile(file);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -38,10 +53,31 @@ export default function HomePage() {
       });
 
       const data = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(data?.detail ?? "Project could not be created.");
+      if (!response.ok) {
+        throw new Error(data?.detail ?? "Project could not be created.");
+      }
 
       setProjectId(data.id);
       setStatusMessage(`Project created as ${data.status}.`);
+
+      if (audioFile) {
+        setStatusMessage("Project created. Uploading audio...");
+
+        const uploadForm = new FormData();
+        uploadForm.append("file", audioFile, audioFile.name);
+
+        const uploadResponse = await fetch(`/api/projects/${data.id}/audio`, {
+          method: "POST",
+          body: uploadForm,
+        });
+
+        const uploadData = await uploadResponse.json().catch(() => null);
+        if (!uploadResponse.ok) {
+          throw new Error(uploadData?.detail ?? "Audio upload failed.");
+        }
+
+        setStatusMessage(`Project created and audio uploaded (${uploadData.filename}).`);
+      }
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Project creation failed.");
     } finally {
@@ -80,7 +116,7 @@ export default function HomePage() {
               <label htmlFor="audio" style={styles.uploadBox}>
                 <span style={styles.uploadIcon}>↑</span>
                 <strong>{audioFile ? audioFile.name : "Upload MP3 or WAV"}</strong>
-                <span style={styles.helper}>The file will be connected to the storage pipeline next.</span>
+                <span style={styles.helper}>MP3/WAV · maximum 100 MB</span>
               </label>
               <input id="audio" type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/*" onChange={handleAudioChange} style={styles.hiddenInput} />
             </div>
@@ -104,14 +140,14 @@ export default function HomePage() {
           <div style={styles.footer}>
             <div>
               <div style={styles.footerTitle}>Ready to create</div>
-              <div style={styles.helper}>Create Project now calls the application API.</div>
+              <div style={styles.helper}>{audioFile ? "Project and audio will be sent to the application API." : "Create Project calls the application API."}</div>
             </div>
             <button type="submit" style={styles.primaryButton} disabled={isSubmitting}>{isSubmitting ? "Creating..." : "Create Project"} <span>→</span></button>
           </div>
         </form>
 
         {statusMessage && <div style={styles.success} role="status"><strong>{statusMessage}</strong>{projectId && <div style={styles.helper}>Project ID: {projectId}</div>}</div>}
-        {error && <div style={styles.error} role="alert"><strong>Could not create project.</strong><div>{error}</div></div>}
+        {error && <div style={styles.error} role="alert"><strong>Could not complete project creation.</strong><div>{error}</div></div>}
       </section>
     </main>
   );
