@@ -39,18 +39,8 @@ def _dimensions(output_format: str) -> tuple[int, int]:
     return (1920, 1080) if output_format == "16:9" else (1080, 1920)
 
 
-def _validate_video(ffmpeg: str, video_path: Path) -> None:
-    validation = run(
-        [ffmpeg, "-v", "error", "-i", str(video_path), "-map", "0", "-c", "copy", "-f", "null", "-"],
-        stdout=PIPE, stderr=PIPE, check=False,
-    )
-    if validation.returncode != 0:
-        detail = validation.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"Rendered MP4 validation failed: {detail[:500]}")
-
-
 def recover_interrupted_renders() -> None:
-    """Fail renders left behind when the Render web process restarted/OOM-killed."""
+    """Mark renders interrupted by a process restart as failed."""
     SessionLocal = get_session_factory()
     db = SessionLocal()
     try:
@@ -67,71 +57,101 @@ def recover_interrupted_renders() -> None:
 def _render_video_job(project_id: UUID, output_format: str) -> None:
     SessionLocal = get_session_factory()
     db = SessionLocal()
-    temp_video_path = PROJECT_ROOT / str(project_id) / "video.mp4.part"
+    temp_video_path: Path | None = None
 
     try:
         project = db.get(Project, project_id)
         if project is None or project.analysis is None:
             return
 
-        try:
-            audio_path = _audio_path(project)
-            width, height = _dimensions(output_format)
-            project_dir = PROJECT_ROOT / str(project_id)
-            project_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = _audio_path(project)
+        width, height = _dimensions(output_format)
+        project_dir = PROJECT_ROOT / str(project_id)
+        project_dir.mkdir(parents=True, exist_ok=True)
 
-            video_path = project_dir / "video.mp4"
-            temp_video_path = project_dir / "video.mp4.part"
+        video_path = project_dir / "video.mp4"
+        temp_video_path = project_dir / "video.mp4.part"
+        temp_video_path.unlink(missing_ok=True)
+        video_path.unlink(missing_ok=True)
+
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        duration = max(float(project.analysis.duration_seconds), 0.1)
+
+        # Render one video frame per second. The source is a static color frame,
+        # so this keeps CPU/RAM usage substantially lower than 24/30 fps rendering.
+        command = [
+            ffmpeg,
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=0x0b1020:s={width}x{height}:r=1",
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-t",
+            f"{duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "stillimage",
+            "-threads",
+            "1",
+            "-crf",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            str(temp_video_path),
+        ]
+
+        result = run(command, stdout=PIPE, stderr=PIPE, check=False)
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+
+        if result.returncode != 0:
+            print(f"[render] FFmpeg failed for {project_id}: {stderr[-4000:]}", flush=True)
+            raise RuntimeError(f"FFmpeg render failed: {stderr[-1000:]}")
+
+        if not temp_video_path.exists() or temp_video_path.stat().st_size == 0:
+            raise RuntimeError("FFmpeg completed without producing a valid MP4")
+
+        # Do not run a second full FFmpeg validation pass here. It doubles I/O
+        # and decoding work and is unnecessary after a successful encode.
+        temp_video_path.replace(video_path)
+
+        project.status = "rendered"
+        db.add(project)
+        db.commit()
+        print(
+            f"[render] completed project={project_id} size={video_path.stat().st_size} bytes duration={duration:.3f}s",
+            flush=True,
+        )
+
+    except Exception as exc:
+        if temp_video_path is not None:
             temp_video_path.unlink(missing_ok=True)
 
-            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-            duration = max(float(project.analysis.duration_seconds), 0.1)
-
-            # Current renderer is a static background. One frame per second
-            # avoids encoding 30 identical frames every second and cuts CPU/RAM.
-            result = run(
-                [
-                    ffmpeg, "-y", "-nostdin", "-v", "error",
-                    "-f", "lavfi", "-i",
-                    f"color=c=0x0b1020:s={width}x{height}:r=1",
-                    "-i", str(audio_path),
-                    "-map", "0:v:0", "-map", "1:a:0",
-                    "-t", f"{duration:.3f}",
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-tune", "stillimage",
-                    "-threads", "1",
-                    "-crf", "30",
-                    "-pix_fmt", "yuv420p",
-                    "-c:a", "aac",
-                    "-b:a", "96k",
-                    "-movflags", "+faststart",
-                    str(temp_video_path),
-                ],
-                stdout=PIPE, stderr=PIPE, check=False,
-            )
-
-            if result.returncode != 0:
-                detail = result.stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"Video render failed: {detail[:500]}")
-
-            if not temp_video_path.exists() or temp_video_path.stat().st_size == 0:
-                raise RuntimeError("Video render failed: generated MP4 is empty")
-
-            _validate_video(ffmpeg, temp_video_path)
-            temp_video_path.replace(video_path)
-
-            project.status = "rendered"
+        project = db.get(Project, project_id)
+        if project is not None:
+            project.status = "render_failed"
             db.add(project)
             db.commit()
 
-        except Exception:
-            temp_video_path.unlink(missing_ok=True)
-            project = db.get(Project, project_id)
-            if project is not None:
-                project.status = "render_failed"
-                db.add(project)
-                db.commit()
+        print(f"[render] failed project={project_id}: {exc}", flush=True)
 
     finally:
         db.close()
@@ -205,7 +225,7 @@ def render_status(project_id: UUID, db: Session = Depends(get_db)) -> RenderResp
             height=height,
             duration_seconds=round(project.analysis.duration_seconds, 3),
             format=output_format,
-            error="Video rendering failed. Please try again.",
+            error="Video rendering failed. Check the Render service logs for the FFmpeg error.",
         )
 
     return RenderResponse(
