@@ -71,7 +71,6 @@ def _validate_video(ffmpeg: str, video_path: Path) -> None:
 
     if validation.returncode != 0:
         detail = validation.stderr.decode("utf-8", errors="replace").strip()
-        video_path.unlink(missing_ok=True)
         raise RuntimeError(f"Rendered MP4 validation failed: {detail[:500]}")
 
 
@@ -83,6 +82,25 @@ def _set_project_status(project_id: UUID, status: str) -> None:
         if project is not None:
             project.status = status
             db.add(project)
+            db.commit()
+    finally:
+        db.close()
+
+
+def recover_interrupted_renders() -> None:
+    """Mark in-progress renders as failed after a process restart.
+
+    Rendering runs in the web process. If Render restarts or OOM-kills that
+    process, a job cannot continue and must not remain stuck forever.
+    """
+    SessionLocal = get_session_factory()
+    db = SessionLocal()
+    try:
+        projects = db.query(Project).filter(Project.status == "rendering").all()
+        for project in projects:
+            project.status = "render_failed"
+            db.add(project)
+        if projects:
             db.commit()
     finally:
         db.close()
@@ -105,7 +123,11 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
             project_dir.mkdir(parents=True, exist_ok=True)
 
             video_path = project_dir / "video.mp4"
+            temp_video_path = project_dir / "video.mp4.part"
+            temp_video_path.unlink(missing_ok=True)
+
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            duration = max(float(project.analysis.duration_seconds), 0.1)
 
             result = run(
                 [
@@ -124,6 +146,8 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
                     "0:v:0",
                     "-map",
                     "1:a:0",
+                    "-t",
+                    f"{duration:.3f}",
                     "-c:v",
                     "libx264",
                     "-preset",
@@ -133,39 +157,42 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
                     "-threads",
                     "1",
                     "-crf",
-                    "28",
+                    "30",
                     "-pix_fmt",
                     "yuv420p",
                     "-c:a",
                     "aac",
                     "-b:a",
-                    "128k",
-                    "-shortest",
+                    "96k",
                     "-movflags",
                     "+faststart",
-                    str(video_path),
+                    str(temp_video_path),
                 ],
                 stdout=PIPE,
                 stderr=PIPE,
                 check=False,
             )
 
-            if result.returncode != 0 or not video_path.exists():
-                video_path.unlink(missing_ok=True)
+            if result.returncode != 0:
                 detail = result.stderr.decode("utf-8", errors="replace").strip()
                 raise RuntimeError(f"Video render failed: {detail[:500]}")
 
-            if video_path.stat().st_size == 0:
-                video_path.unlink(missing_ok=True)
+            if not temp_video_path.exists() or temp_video_path.stat().st_size == 0:
                 raise RuntimeError("Video render failed: generated MP4 is empty")
 
-            _validate_video(ffmpeg, video_path)
+            _validate_video(ffmpeg, temp_video_path)
+
+            # Never expose a partially-written MP4. The final filename only
+            # appears after FFmpeg has exited successfully and validation passed.
+            temp_video_path.replace(video_path)
 
             project.status = "rendered"
             db.add(project)
             db.commit()
 
         except Exception:
+            temp_video_path = PROJECT_ROOT / str(project_id) / "video.mp4.part"
+            temp_video_path.unlink(missing_ok=True)
             project = db.get(Project, project_id)
             if project is not None:
                 project.status = "render_failed"
@@ -283,6 +310,9 @@ def get_rendered_video(
 
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.status != "rendered":
+        raise HTTPException(status_code=409, detail="Rendered video is not ready")
 
     video_path = PROJECT_ROOT / str(project_id) / "video.mp4"
 
