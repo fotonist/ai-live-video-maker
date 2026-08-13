@@ -12,8 +12,11 @@ export default function HomePage() {
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [format, setFormat] = useState("9:16");
   const [singer, setSinger] = useState("Female");
+
   const [statusMessage, setStatusMessage] = useState("");
   const [projectId, setProjectId] = useState("");
+  const [videoUrl, setVideoUrl] = useState("");
+
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
 
@@ -36,17 +39,37 @@ export default function HomePage() {
     setAudioFile(file);
   }
 
+  async function postJson(path: string, init?: RequestInit) {
+    const response = await fetch(`${BACKEND_URL}${path}`, init);
+
+    const data = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error(
+        data?.detail ?? `Request failed (${response.status}).`
+      );
+    }
+
+    return data;
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     setError("");
     setStatusMessage("");
     setProjectId("");
+    setVideoUrl("");
     setIsSubmitting(true);
 
     try {
-      // 1. Create project through Vercel API route
-      const response = await fetch("/api/projects", {
+      // ---------------------------------------------------------
+      // 1. CREATE PROJECT
+      // ---------------------------------------------------------
+
+      setStatusMessage("Creating project...");
+
+      const project = await postJson("/projects", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -60,55 +83,97 @@ export default function HomePage() {
         }),
       });
 
-      const data = await response.json().catch(() => null);
-
-      if (!response.ok) {
-        throw new Error(
-          data?.detail ?? "Project could not be created."
-        );
-      }
-
-      setProjectId(data.id);
+      setProjectId(project.id);
 
       if (!audioFile) {
-        setStatusMessage(`Project created as ${data.status}.`);
+        setStatusMessage(`Project created as ${project.status}.`);
         return;
       }
 
-      // 2. Upload audio DIRECTLY to Render.
-      // This avoids sending a large audio file through a Vercel
-      // Serverless Function and hitting the request-body limit.
-      setStatusMessage(
-        "Project created. Uploading audio directly to the application API..."
-      );
+      // ---------------------------------------------------------
+      // 2. UPLOAD AUDIO
+      // ---------------------------------------------------------
+
+      setStatusMessage("Uploading audio...");
 
       const uploadForm = new FormData();
-      uploadForm.append("file", audioFile, audioFile.name);
 
-      const uploadResponse = await fetch(
-        `${BACKEND_URL}/projects/${data.id}/audio`,
+      uploadForm.append(
+        "file",
+        audioFile,
+        audioFile.name
+      );
+
+      await postJson(
+        `/projects/${project.id}/audio`,
         {
           method: "POST",
           body: uploadForm,
         }
       );
 
-      const uploadData = await uploadResponse.json().catch(() => null);
+      // ---------------------------------------------------------
+      // 3. ANALYZE AUDIO
+      // ---------------------------------------------------------
 
-      if (!uploadResponse.ok) {
-        throw new Error(
-          uploadData?.detail ?? "Audio upload failed."
-        );
-      }
+      setStatusMessage("Analyzing audio...");
+
+      await postJson(
+        `/projects/${project.id}/analyze`,
+        {
+          method: "POST",
+        }
+      );
+
+      // ---------------------------------------------------------
+      // 4. BUILD STORYBOARD
+      // ---------------------------------------------------------
+
+      setStatusMessage("Building storyboard...");
+
+      await postJson(
+        `/projects/${project.id}/storyboard`,
+        {
+          method: "POST",
+        }
+      );
+
+      // ---------------------------------------------------------
+      // 5. RENDER VIDEO
+      // ---------------------------------------------------------
 
       setStatusMessage(
-        `Project created and audio uploaded (${uploadData.filename}).`
+        "Rendering video... This can take a little while."
+      );
+
+      const render = await postJson(
+        `/projects/${project.id}/render?output_format=${encodeURIComponent(
+          format
+        )}`,
+        {
+          method: "POST",
+        }
+      );
+
+      // ---------------------------------------------------------
+      // 6. VIDEO URL
+      // ---------------------------------------------------------
+
+      const absoluteVideoUrl =
+        render.video_url.startsWith("http")
+          ? render.video_url
+          : `${BACKEND_URL}${render.video_url}`;
+
+      setVideoUrl(absoluteVideoUrl);
+
+      setStatusMessage(
+        "Video rendered successfully."
       );
     } catch (submitError) {
       setError(
         submitError instanceof Error
           ? submitError.message
-          : "Project creation failed."
+          : "Video creation failed."
       );
     } finally {
       setIsSubmitting(false);
@@ -122,22 +187,32 @@ export default function HomePage() {
       <section style={styles.shell}>
         <header style={styles.header}>
           <div>
-            <div style={styles.eyebrow}>AI LIVE VIDEO MAKER</div>
+            <div style={styles.eyebrow}>
+              AI LIVE VIDEO MAKER
+            </div>
 
             <h1 style={styles.title}>
               Turn a song into a live performance.
             </h1>
 
             <p style={styles.subtitle}>
-              Upload your music and lyrics. Build the first version of
-              your AI-generated concert video.
+              Upload your music and lyrics. Build and render
+              the first version of your AI-generated concert
+              video.
             </p>
           </div>
 
-          <div style={styles.status}>Prototype</div>
+          <div style={styles.status}>
+            Prototype
+          </div>
         </header>
 
-        <form onSubmit={handleSubmit} style={styles.form}>
+        <form
+          onSubmit={handleSubmit}
+          style={styles.form}
+        >
+          {/* PROJECT NAME */}
+
           <div style={styles.card}>
             <label
               style={styles.label}
@@ -157,6 +232,8 @@ export default function HomePage() {
               required
             />
           </div>
+
+          {/* LYRICS */}
 
           <div style={styles.card}>
             <label
@@ -184,6 +261,8 @@ export default function HomePage() {
           </div>
 
           <div style={styles.grid}>
+            {/* AUDIO */}
+
             <div style={styles.card}>
               <label
                 style={styles.label}
@@ -196,7 +275,9 @@ export default function HomePage() {
                 htmlFor="audio"
                 style={styles.uploadBox}
               >
-                <span style={styles.uploadIcon}>↑</span>
+                <span style={styles.uploadIcon}>
+                  ↑
+                </span>
 
                 <strong>
                   {audioFile
@@ -218,27 +299,33 @@ export default function HomePage() {
               />
             </div>
 
+            {/* OPTIONS */}
+
             <div style={styles.card}>
               <label style={styles.label}>
                 Output format
               </label>
 
               <div style={styles.optionRow}>
-                {["9:16", "16:9"].map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    onClick={() => setFormat(option)}
-                    style={{
-                      ...styles.option,
-                      ...(format === option
-                        ? styles.optionActive
-                        : {}),
-                    }}
-                  >
-                    {option}
-                  </button>
-                ))}
+                {["9:16", "16:9"].map(
+                  (option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      onClick={() =>
+                        setFormat(option)
+                      }
+                      style={{
+                        ...styles.option,
+                        ...(format === option
+                          ? styles.optionActive
+                          : {}),
+                      }}
+                    >
+                      {option}
+                    </button>
+                  )
+                )}
               </div>
 
               <label
@@ -251,24 +338,30 @@ export default function HomePage() {
               </label>
 
               <div style={styles.optionRow}>
-                {["Female", "Male"].map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    onClick={() => setSinger(option)}
-                    style={{
-                      ...styles.option,
-                      ...(singer === option
-                        ? styles.optionActive
-                        : {}),
-                    }}
-                  >
-                    {option}
-                  </button>
-                ))}
+                {["Female", "Male"].map(
+                  (option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      onClick={() =>
+                        setSinger(option)
+                      }
+                      style={{
+                        ...styles.option,
+                        ...(singer === option
+                          ? styles.optionActive
+                          : {}),
+                      }}
+                    >
+                      {option}
+                    </button>
+                  )
+                )}
               </div>
             </div>
           </div>
+
+          {/* ACTION */}
 
           <div style={styles.footer}>
             <div>
@@ -278,8 +371,8 @@ export default function HomePage() {
 
               <div style={styles.helper}>
                 {audioFile
-                  ? "Project and audio will be sent to the application API."
-                  : "Create Project calls the application API."}
+                  ? "Create → Upload → Analyze → Storyboard → Render"
+                  : "Add an audio file to render a video."}
               </div>
             </div>
 
@@ -288,27 +381,56 @@ export default function HomePage() {
               style={styles.primaryButton}
               disabled={isSubmitting}
             >
-              {isSubmitting ? "Creating..." : "Create Project"}
+              {isSubmitting
+                ? "Creating..."
+                : "Create Video"}
 
               <span>→</span>
             </button>
           </div>
         </form>
 
+        {/* SUCCESS */}
+
         {statusMessage && (
           <div
             style={styles.success}
             role="status"
           >
-            <strong>{statusMessage}</strong>
+            <strong>
+              {statusMessage}
+            </strong>
 
             {projectId && (
               <div style={styles.helper}>
                 Project ID: {projectId}
               </div>
             )}
+
+            {videoUrl && (
+              <div style={styles.videoActions}>
+                <a
+                  href={videoUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={styles.videoLink}
+                >
+                  Open MP4
+                </a>
+
+                <a
+                  href={videoUrl}
+                  download
+                  style={styles.downloadLink}
+                >
+                  Download MP4
+                </a>
+              </div>
+            )}
           </div>
         )}
+
+        {/* ERROR */}
 
         {error && (
           <div
@@ -316,7 +438,7 @@ export default function HomePage() {
             role="alert"
           >
             <strong>
-              Could not complete project creation.
+              Could not create the video.
             </strong>
 
             <div>{error}</div>
@@ -327,7 +449,10 @@ export default function HomePage() {
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
+const styles: Record<
+  string,
+  React.CSSProperties
+> = {
   page: {
     minHeight: "100vh",
     background: "#07090d",
@@ -335,7 +460,8 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "48px 24px",
     position: "relative",
     overflow: "hidden",
-    fontFamily: "Arial, Helvetica, sans-serif",
+    fontFamily:
+      "Arial, Helvetica, sans-serif",
   },
 
   backgroundGlow: {
@@ -376,7 +502,8 @@ const styles: Record<string, React.CSSProperties> = {
   title: {
     margin: 0,
     maxWidth: 760,
-    fontSize: "clamp(36px, 6vw, 68px)",
+    fontSize:
+      "clamp(36px, 6vw, 68px)",
     lineHeight: 0.98,
     letterSpacing: "-0.045em",
   },
@@ -404,11 +531,13 @@ const styles: Record<string, React.CSSProperties> = {
   },
 
   card: {
-    background: "rgba(15, 18, 25, 0.90)",
+    background:
+      "rgba(15, 18, 25, 0.90)",
     border: "1px solid #252b36",
     borderRadius: 18,
     padding: 22,
-    boxShadow: "0 20px 60px rgba(0, 0, 0, 0.18)",
+    boxShadow:
+      "0 20px 60px rgba(0, 0, 0, 0.18)",
   },
 
   label: {
@@ -558,5 +687,32 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#e5c4c8",
     fontSize: 14,
     lineHeight: 1.6,
+  },
+
+  videoActions: {
+    display: "flex",
+    gap: 10,
+    marginTop: 14,
+    flexWrap: "wrap",
+  },
+
+  videoLink: {
+    display: "inline-block",
+    border: "1px solid #394150",
+    borderRadius: 9,
+    padding: "10px 14px",
+    color: "#dfe4ec",
+    textDecoration: "none",
+    fontWeight: 700,
+  },
+
+  downloadLink: {
+    display: "inline-block",
+    borderRadius: 9,
+    padding: "10px 14px",
+    background: "#f4f5f7",
+    color: "#080a0e",
+    textDecoration: "none",
+    fontWeight: 800,
   },
 };
