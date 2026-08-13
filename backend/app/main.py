@@ -4,6 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.projects import router as projects_router
+from app.db import get_engine
+from app.models import Base
 
 
 app = FastAPI(
@@ -27,6 +29,13 @@ app.add_middleware(
 )
 
 app.include_router(projects_router)
+
+
+@app.on_event("startup")
+def initialize_database() -> None:
+    """Create the application tables when a database is configured."""
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health", tags=["system"])
