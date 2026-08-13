@@ -28,19 +28,10 @@ class RenderResponse(BaseModel):
 
 def _audio_path(project: Project) -> Path:
     if project.audio is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Audio upload is required before rendering",
-        )
-
+        raise HTTPException(status_code=409, detail="Audio upload is required before rendering")
     path = Path(project.audio.storage_path)
-
     if not path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Audio file not found for project",
-        )
-
+        raise HTTPException(status_code=404, detail="Audio file not found for project")
     return path
 
 
@@ -50,49 +41,16 @@ def _dimensions(output_format: str) -> tuple[int, int]:
 
 def _validate_video(ffmpeg: str, video_path: Path) -> None:
     validation = run(
-        [
-            ffmpeg,
-            "-v",
-            "error",
-            "-i",
-            str(video_path),
-            "-map",
-            "0",
-            "-c",
-            "copy",
-            "-f",
-            "null",
-            "-",
-        ],
-        stdout=PIPE,
-        stderr=PIPE,
-        check=False,
+        [ffmpeg, "-v", "error", "-i", str(video_path), "-map", "0", "-c", "copy", "-f", "null", "-"],
+        stdout=PIPE, stderr=PIPE, check=False,
     )
-
     if validation.returncode != 0:
         detail = validation.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"Rendered MP4 validation failed: {detail[:500]}")
 
 
-def _set_project_status(project_id: UUID, status: str) -> None:
-    SessionLocal = get_session_factory()
-    db = SessionLocal()
-    try:
-        project = db.get(Project, project_id)
-        if project is not None:
-            project.status = status
-            db.add(project)
-            db.commit()
-    finally:
-        db.close()
-
-
 def recover_interrupted_renders() -> None:
-    """Mark in-progress renders as failed after a process restart.
-
-    Rendering runs in the web process. If Render restarts or OOM-kills that
-    process, a job cannot continue and must not remain stuck forever.
-    """
+    """Fail renders left behind when the Render web process restarted/OOM-killed."""
     SessionLocal = get_session_factory()
     db = SessionLocal()
     try:
@@ -109,6 +67,7 @@ def recover_interrupted_renders() -> None:
 def _render_video_job(project_id: UUID, output_format: str) -> None:
     SessionLocal = get_session_factory()
     db = SessionLocal()
+    temp_video_path = PROJECT_ROOT / str(project_id) / "video.mp4.part"
 
     try:
         project = db.get(Project, project_id)
@@ -118,7 +77,6 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
         try:
             audio_path = _audio_path(project)
             width, height = _dimensions(output_format)
-
             project_dir = PROJECT_ROOT / str(project_id)
             project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -129,48 +87,28 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             duration = max(float(project.analysis.duration_seconds), 0.1)
 
+            # Current renderer is a static background. One frame per second
+            # avoids encoding 30 identical frames every second and cuts CPU/RAM.
             result = run(
                 [
-                    ffmpeg,
-                    "-y",
-                    "-nostdin",
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    f"color=c=0x0b1020:s={width}x{height}:r=30",
-                    "-i",
-                    str(audio_path),
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0",
-                    "-t",
-                    f"{duration:.3f}",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-tune",
-                    "stillimage",
-                    "-threads",
-                    "1",
-                    "-crf",
-                    "30",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "96k",
-                    "-movflags",
-                    "+faststart",
+                    ffmpeg, "-y", "-nostdin", "-v", "error",
+                    "-f", "lavfi", "-i",
+                    f"color=c=0x0b1020:s={width}x{height}:r=1",
+                    "-i", str(audio_path),
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-t", f"{duration:.3f}",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "stillimage",
+                    "-threads", "1",
+                    "-crf", "30",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "96k",
+                    "-movflags", "+faststart",
                     str(temp_video_path),
                 ],
-                stdout=PIPE,
-                stderr=PIPE,
-                check=False,
+                stdout=PIPE, stderr=PIPE, check=False,
             )
 
             if result.returncode != 0:
@@ -181,9 +119,6 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
                 raise RuntimeError("Video render failed: generated MP4 is empty")
 
             _validate_video(ffmpeg, temp_video_path)
-
-            # Never expose a partially-written MP4. The final filename only
-            # appears after FFmpeg has exited successfully and validation passed.
             temp_video_path.replace(video_path)
 
             project.status = "rendered"
@@ -191,7 +126,6 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
             db.commit()
 
         except Exception:
-            temp_video_path = PROJECT_ROOT / str(project_id) / "video.mp4.part"
             temp_video_path.unlink(missing_ok=True)
             project = db.get(Project, project_id)
             if project is not None:
@@ -214,19 +148,10 @@ def render_project(
 
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-
     if project.analysis is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Audio analysis is required before rendering",
-        )
-
+        raise HTTPException(status_code=409, detail="Audio analysis is required before rendering")
     if output_format not in {"9:16", "16:9"}:
-        raise HTTPException(
-            status_code=422,
-            detail="Output format must be 9:16 or 16:9",
-        )
-
+        raise HTTPException(status_code=422, detail="Output format must be 9:16 or 16:9")
     if project.status == "rendering":
         raise HTTPException(status_code=409, detail="Video rendering is already in progress")
 
@@ -250,26 +175,18 @@ def render_project(
 
 
 @router.get("/{project_id}/render/status", response_model=RenderResponse)
-def render_status(
-    project_id: UUID,
-    db: Session = Depends(get_db),
-) -> RenderResponse:
+def render_status(project_id: UUID, db: Session = Depends(get_db)) -> RenderResponse:
     project = db.get(Project, project_id)
 
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-
     if project.analysis is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Audio analysis is required before rendering",
-        )
+        raise HTTPException(status_code=409, detail="Audio analysis is required before rendering")
 
     output_format = "9:16"
     width, height = _dimensions(output_format)
-    status = project.status
 
-    if status == "rendered":
+    if project.status == "rendered":
         return RenderResponse(
             project_id=project_id,
             status="completed",
@@ -280,7 +197,7 @@ def render_status(
             format=output_format,
         )
 
-    if status == "render_failed":
+    if project.status == "render_failed":
         return RenderResponse(
             project_id=project_id,
             status="failed",
@@ -302,15 +219,11 @@ def render_status(
 
 
 @router.get("/{project_id}/video")
-def get_rendered_video(
-    project_id: UUID,
-    db: Session = Depends(get_db),
-) -> FileResponse:
+def get_rendered_video(project_id: UUID, db: Session = Depends(get_db)) -> FileResponse:
     project = db.get(Project, project_id)
 
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-
     if project.status != "rendered":
         raise HTTPException(status_code=409, detail="Rendered video is not ready")
 
@@ -318,7 +231,6 @@ def get_rendered_video(
 
     if not video_path.exists():
         raise HTTPException(status_code=404, detail="Rendered video not found")
-
     if video_path.stat().st_size == 0:
         raise HTTPException(status_code=500, detail="Rendered video is empty")
 
