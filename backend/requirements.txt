@@ -5,3 +5,5 @@ python-multipart==0.0.20
 pytest==8.4.1
 numpy==2.2.6
 imageio-ffmpeg==0.6.0
+SQLAlchemy==2.0.43
+psycopg[binary]==3.2.9
