@@ -1,10 +1,31 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 
-const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL ??
-  "https://ai-live-video-maker.onrender.com";
+const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL ?? "").replace(/\/$/, "");
+
+type RenderStatus = "idle" | "rendering" | "completed" | "failed";
+
+type ApiError = {
+  detail?: string;
+};
+
+type ProjectResponse = {
+  id: string;
+  status?: string;
+  name?: string;
+};
+
+type RenderResponse = {
+  project_id: string;
+  status: string;
+  video_url?: string;
+  width?: number;
+  height?: number;
+  duration_seconds?: number;
+  format?: string;
+  error?: string | null;
+};
 
 export default function HomePage() {
   const [projectName, setProjectName] = useState("");
@@ -13,12 +34,58 @@ export default function HomePage() {
   const [format, setFormat] = useState("9:16");
   const [singer, setSinger] = useState("Female");
 
-  const [statusMessage, setStatusMessage] = useState("");
   const [projectId, setProjectId] = useState("");
-  const [videoUrl, setVideoUrl] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
+  const [error, setError] = useState("");
 
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [error, setError] = useState("");
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [renderStatus, setRenderStatus] = useState<RenderStatus>("idle");
+  const [renderError, setRenderError] = useState("");
+  const [videoUrl, setVideoUrl] = useState("");
+
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (pollTimer.current) {
+        clearTimeout(pollTimer.current);
+      }
+    };
+  }, []);
+
+  function apiBase(): string {
+    if (!backendUrl) {
+      throw new Error("NEXT_PUBLIC_BACKEND_URL is not configured.");
+    }
+    return backendUrl;
+  }
+
+  async function apiFetch<T>(
+    path: string,
+    options?: RequestInit,
+  ): Promise<T> {
+    const response = await fetch(`${apiBase()}${path}`, options);
+
+    const data = (await response.json().catch(() => null)) as
+      | T
+      | ApiError
+      | null;
+
+    if (!response.ok) {
+      const detail =
+        data && typeof data === "object" && "detail" in data
+          ? data.detail
+          : undefined;
+
+      throw new Error(
+        detail ||
+          `Request failed (${response.status}).`,
+      );
+    }
+
+    return data as T;
+  }
 
   function handleAudioChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0] ?? null;
@@ -39,145 +106,200 @@ export default function HomePage() {
     setAudioFile(file);
   }
 
-  async function postJson(path: string, init?: RequestInit) {
-    const response = await fetch(`${BACKEND_URL}${path}`, init);
+  async function createProjectAndUploadAudio(): Promise<string> {
+    if (!projectName.trim()) {
+      throw new Error("Project name is required.");
+    }
 
-    const data = await response.json().catch(() => null);
+    if (!lyrics.trim()) {
+      throw new Error("Lyrics are required.");
+    }
 
-    if (!response.ok) {
+    if (!audioFile) {
+      throw new Error("Please upload an MP3 or WAV file.");
+    }
+
+    setStatusMessage("Creating project...");
+
+    const project = await apiFetch<ProjectResponse>("/projects", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: projectName.trim(),
+        lyrics,
+        format,
+        singer,
+        audio_file_name: audioFile.name,
+      }),
+    });
+
+    const id = project.id;
+
+    setProjectId(id);
+    setStatusMessage("Project created. Uploading audio...");
+
+    const uploadForm = new FormData();
+    uploadForm.append("file", audioFile, audioFile.name);
+
+    const uploadResponse = await fetch(
+      `${apiBase()}/projects/${id}/audio`,
+      {
+        method: "POST",
+        body: uploadForm,
+      },
+    );
+
+    const uploadData = (await uploadResponse.json().catch(() => null)) as
+      | { filename?: string; detail?: string }
+      | null;
+
+    if (!uploadResponse.ok) {
       throw new Error(
-        data?.detail ?? `Request failed (${response.status}).`
+        uploadData?.detail || "Audio upload failed.",
       );
     }
 
-    return data;
+    setStatusMessage(
+      `Audio uploaded${uploadData?.filename ? `: ${uploadData.filename}` : "."}`,
+    );
+
+    return id;
+  }
+
+  async function analyzeProject(id: string) {
+    setStatusMessage("Analyzing audio...");
+    await apiFetch(`/projects/${id}/analyze`, {
+      method: "POST",
+    });
+  }
+
+  async function createStoryboard(id: string) {
+    setStatusMessage("Building storyboard...");
+    await apiFetch(`/projects/${id}/storyboard`, {
+      method: "POST",
+    });
+  }
+
+  async function startRender(id: string) {
+    setStatusMessage("Starting video render...");
+    setRenderStatus("rendering");
+    setRenderError("");
+    setVideoUrl("");
+
+    await apiFetch<RenderResponse>(
+      `/projects/${id}/render?output_format=${encodeURIComponent(format)}`,
+      {
+        method: "POST",
+      },
+    );
+  }
+
+  async function pollRenderStatus(id: string) {
+    try {
+      const data = await apiFetch<RenderResponse>(
+        `/projects/${id}/render/status`,
+      );
+
+      if (data.status === "completed") {
+        setRenderStatus("completed");
+
+        const relativeVideoUrl =
+          data.video_url || `/projects/${id}/video`;
+
+        setVideoUrl(
+          relativeVideoUrl.startsWith("http")
+            ? relativeVideoUrl
+            : `${apiBase()}${relativeVideoUrl}`,
+        );
+
+        setStatusMessage("Video rendering completed.");
+        setIsProcessing(false);
+        return;
+      }
+
+      if (data.status === "failed") {
+        setRenderStatus("failed");
+        setRenderError(
+          data.error || "Video rendering failed.",
+        );
+        setStatusMessage("");
+        setIsProcessing(false);
+        return;
+      }
+
+      setRenderStatus("rendering");
+      setStatusMessage("Rendering video...");
+
+      pollTimer.current = setTimeout(
+        () => void pollRenderStatus(id),
+        3000,
+      );
+    } catch (pollError) {
+      setRenderStatus("failed");
+      setRenderError(
+        pollError instanceof Error
+          ? pollError.message
+          : "Could not check render status.",
+      );
+      setIsProcessing(false);
+    }
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
+    if (isSubmitting || isProcessing) {
+      return;
+    }
+
     setError("");
+    setRenderError("");
     setStatusMessage("");
     setProjectId("");
     setVideoUrl("");
+    setRenderStatus("idle");
     setIsSubmitting(true);
+    setIsProcessing(true);
 
     try {
-      // ---------------------------------------------------------
-      // 1. CREATE PROJECT
-      // ---------------------------------------------------------
-
-      setStatusMessage("Creating project...");
-
-      const project = await postJson("/projects", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          name: projectName.trim(),
-          lyrics,
-          format,
-          singer,
-          audio_file_name: audioFile?.name ?? null,
-        }),
-      });
-
-      setProjectId(project.id);
-
-      if (!audioFile) {
-        setStatusMessage(`Project created as ${project.status}.`);
-        return;
-      }
-
-      // ---------------------------------------------------------
-      // 2. UPLOAD AUDIO
-      // ---------------------------------------------------------
-
-      setStatusMessage("Uploading audio...");
-
-      const uploadForm = new FormData();
-
-      uploadForm.append(
-        "file",
-        audioFile,
-        audioFile.name
-      );
-
-      await postJson(
-        `/projects/${project.id}/audio`,
-        {
-          method: "POST",
-          body: uploadForm,
-        }
-      );
-
-      // ---------------------------------------------------------
-      // 3. ANALYZE AUDIO
-      // ---------------------------------------------------------
-
-      setStatusMessage("Analyzing audio...");
-
-      await postJson(
-        `/projects/${project.id}/analyze`,
-        {
-          method: "POST",
-        }
-      );
-
-      // ---------------------------------------------------------
-      // 4. BUILD STORYBOARD
-      // ---------------------------------------------------------
-
-      setStatusMessage("Building storyboard...");
-
-      await postJson(
-        `/projects/${project.id}/storyboard`,
-        {
-          method: "POST",
-        }
-      );
-
-      // ---------------------------------------------------------
-      // 5. RENDER VIDEO
-      // ---------------------------------------------------------
+      const id = await createProjectAndUploadAudio();
+      await analyzeProject(id);
+      await createStoryboard(id);
+      await startRender(id);
 
       setStatusMessage(
-        "Rendering video... This can take a little while."
+        "Rendering started. This page will update automatically.",
       );
 
-      const render = await postJson(
-        `/projects/${project.id}/render?output_format=${encodeURIComponent(
-          format
-        )}`,
-        {
-          method: "POST",
-        }
-      );
-
-      // ---------------------------------------------------------
-      // 6. VIDEO URL
-      // ---------------------------------------------------------
-
-      const absoluteVideoUrl =
-        render.video_url.startsWith("http")
-          ? render.video_url
-          : `${BACKEND_URL}${render.video_url}`;
-
-      setVideoUrl(absoluteVideoUrl);
-
-      setStatusMessage(
-        "Video rendered successfully."
-      );
+      await pollRenderStatus(id);
     } catch (submitError) {
+      setIsProcessing(false);
+      setRenderStatus("failed");
       setError(
         submitError instanceof Error
           ? submitError.message
-          : "Video creation failed."
+          : "Project creation failed.",
       );
     } finally {
       setIsSubmitting(false);
     }
+  }
+
+  function downloadVideo() {
+    if (!videoUrl) {
+      return;
+    }
+
+    const link = document.createElement("a");
+    link.href = videoUrl;
+    link.download = `${projectName.trim() || "ai-live-video"}.mp4`;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
   }
 
   return (
@@ -187,40 +309,30 @@ export default function HomePage() {
       <section style={styles.shell}>
         <header style={styles.header}>
           <div>
-            <div style={styles.eyebrow}>
-              AI LIVE VIDEO MAKER
-            </div>
-
+            <div style={styles.eyebrow}>AI LIVE VIDEO MAKER</div>
             <h1 style={styles.title}>
               Turn a song into a live performance.
             </h1>
-
             <p style={styles.subtitle}>
-              Upload your music and lyrics. Build and render
-              the first version of your AI-generated concert
-              video.
+              Upload your music and lyrics. Build an AI-generated
+              concert video from one workflow.
             </p>
           </div>
 
           <div style={styles.status}>
-            Prototype
+            {renderStatus === "rendering"
+              ? "Rendering"
+              : renderStatus === "completed"
+                ? "Completed"
+                : "Ready"}
           </div>
         </header>
 
-        <form
-          onSubmit={handleSubmit}
-          style={styles.form}
-        >
-          {/* PROJECT NAME */}
-
+        <form onSubmit={handleSubmit} style={styles.form}>
           <div style={styles.card}>
-            <label
-              style={styles.label}
-              htmlFor="project-name"
-            >
+            <label style={styles.label} htmlFor="project-name">
               Project name
             </label>
-
             <input
               id="project-name"
               value={projectName}
@@ -229,20 +341,15 @@ export default function HomePage() {
               }
               placeholder="My Concert Video"
               style={styles.input}
+              disabled={isSubmitting || isProcessing}
               required
             />
           </div>
 
-          {/* LYRICS */}
-
           <div style={styles.card}>
-            <label
-              style={styles.label}
-              htmlFor="lyrics"
-            >
+            <label style={styles.label} htmlFor="lyrics">
               Lyrics
             </label>
-
             <textarea
               id="lyrics"
               value={lyrics}
@@ -252,39 +359,35 @@ export default function HomePage() {
               placeholder="Paste your song lyrics here..."
               style={styles.textarea}
               rows={9}
+              disabled={isSubmitting || isProcessing}
               required
             />
-
             <div style={styles.helper}>
               {lyrics.length} characters
             </div>
           </div>
 
           <div style={styles.grid}>
-            {/* AUDIO */}
-
             <div style={styles.card}>
-              <label
-                style={styles.label}
-                htmlFor="audio"
-              >
+              <label style={styles.label} htmlFor="audio">
                 Music
               </label>
 
               <label
                 htmlFor="audio"
-                style={styles.uploadBox}
+                style={{
+                  ...styles.uploadBox,
+                  ...(isSubmitting || isProcessing
+                    ? styles.disabledBox
+                    : {}),
+                }}
               >
-                <span style={styles.uploadIcon}>
-                  ↑
-                </span>
-
+                <span style={styles.uploadIcon}>↑</span>
                 <strong>
                   {audioFile
                     ? audioFile.name
                     : "Upload MP3 or WAV"}
                 </strong>
-
                 <span style={styles.helper}>
                   MP3/WAV · maximum 100 MB
                 </span>
@@ -296,10 +399,9 @@ export default function HomePage() {
                 accept="audio/mpeg,audio/wav,audio/x-wav,audio/*"
                 onChange={handleAudioChange}
                 style={styles.hiddenInput}
+                disabled={isSubmitting || isProcessing}
               />
             </div>
-
-            {/* OPTIONS */}
 
             <div style={styles.card}>
               <label style={styles.label}>
@@ -307,25 +409,22 @@ export default function HomePage() {
               </label>
 
               <div style={styles.optionRow}>
-                {["9:16", "16:9"].map(
-                  (option) => (
-                    <button
-                      key={option}
-                      type="button"
-                      onClick={() =>
-                        setFormat(option)
-                      }
-                      style={{
-                        ...styles.option,
-                        ...(format === option
-                          ? styles.optionActive
-                          : {}),
-                      }}
-                    >
-                      {option}
-                    </button>
-                  )
-                )}
+                {["9:16", "16:9"].map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    onClick={() => setFormat(option)}
+                    style={{
+                      ...styles.option,
+                      ...(format === option
+                        ? styles.optionActive
+                        : {}),
+                    }}
+                    disabled={isSubmitting || isProcessing}
+                  >
+                    {option}
+                  </button>
+                ))}
               </div>
 
               <label
@@ -338,110 +437,131 @@ export default function HomePage() {
               </label>
 
               <div style={styles.optionRow}>
-                {["Female", "Male"].map(
-                  (option) => (
-                    <button
-                      key={option}
-                      type="button"
-                      onClick={() =>
-                        setSinger(option)
-                      }
-                      style={{
-                        ...styles.option,
-                        ...(singer === option
-                          ? styles.optionActive
-                          : {}),
-                      }}
-                    >
-                      {option}
-                    </button>
-                  )
-                )}
+                {["Female", "Male"].map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    onClick={() => setSinger(option)}
+                    style={{
+                      ...styles.option,
+                      ...(singer === option
+                        ? styles.optionActive
+                        : {}),
+                    }}
+                    disabled={isSubmitting || isProcessing}
+                  >
+                    {option}
+                  </button>
+                ))}
               </div>
             </div>
           </div>
 
-          {/* ACTION */}
-
           <div style={styles.footer}>
             <div>
               <div style={styles.footerTitle}>
-                Ready to create
+                {renderStatus === "rendering"
+                  ? "Rendering in progress"
+                  : renderStatus === "completed"
+                    ? "Video ready"
+                    : "Ready to create"}
               </div>
 
               <div style={styles.helper}>
-                {audioFile
-                  ? "Create → Upload → Analyze → Storyboard → Render"
-                  : "Add an audio file to render a video."}
+                {renderStatus === "rendering"
+                  ? "The page checks the render status automatically."
+                  : renderStatus === "completed"
+                    ? "Your MP4 video is ready."
+                    : "Create → Analyze → Storyboard → Render."}
               </div>
             </div>
 
             <button
               type="submit"
-              style={styles.primaryButton}
-              disabled={isSubmitting}
+              style={{
+                ...styles.primaryButton,
+                ...(isSubmitting || isProcessing
+                  ? styles.buttonDisabled
+                  : {}),
+              }}
+              disabled={isSubmitting || isProcessing}
             >
               {isSubmitting
                 ? "Creating..."
-                : "Create Video"}
-
+                : isProcessing
+                  ? "Rendering..."
+                  : "Create & Render"}
               <span>→</span>
             </button>
           </div>
         </form>
 
-        {/* SUCCESS */}
-
-        {statusMessage && (
-          <div
-            style={styles.success}
-            role="status"
-          >
-            <strong>
-              {statusMessage}
-            </strong>
-
-            {projectId && (
-              <div style={styles.helper}>
-                Project ID: {projectId}
-              </div>
-            )}
-
-            {videoUrl && (
-              <div style={styles.videoActions}>
-                <a
-                  href={videoUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={styles.videoLink}
-                >
-                  Open MP4
-                </a>
-
-                <a
-                  href={videoUrl}
-                  download
-                  style={styles.downloadLink}
-                >
-                  Download MP4
-                </a>
-              </div>
-            )}
+        {projectId && (
+          <div style={styles.projectPanel}>
+            <div style={styles.projectLabel}>
+              PROJECT
+            </div>
+            <div style={styles.projectId}>{projectId}</div>
           </div>
         )}
 
-        {/* ERROR */}
+        {renderStatus === "rendering" && (
+          <div style={styles.renderingPanel} role="status">
+            <div style={styles.spinner} />
+            <div>
+              <strong>Rendering video...</strong>
+              <div style={styles.helper}>
+                Keep this page open. We will automatically detect
+                when the MP4 is ready.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {renderStatus === "completed" && videoUrl && (
+          <div style={styles.success} role="status">
+            <strong>Video is ready.</strong>
+
+            <div style={styles.successActions}>
+              <button
+                type="button"
+                onClick={downloadVideo}
+                style={styles.downloadButton}
+              >
+                Download Video
+              </button>
+
+              <a
+                href={videoUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={styles.videoLink}
+              >
+                Open Video
+              </a>
+            </div>
+          </div>
+        )}
+
+        {renderStatus === "failed" && renderError && (
+          <div style={styles.error} role="alert">
+            <strong>Rendering failed.</strong>
+            <div style={styles.errorDetail}>
+              {renderError}
+            </div>
+          </div>
+        )}
+
+        {statusMessage && renderStatus !== "rendering" && (
+          <div style={styles.info} role="status">
+            {statusMessage}
+          </div>
+        )}
 
         {error && (
-          <div
-            style={styles.error}
-            role="alert"
-          >
-            <strong>
-              Could not create the video.
-            </strong>
-
-            <div>{error}</div>
+          <div style={styles.error} role="alert">
+            <strong>Could not complete the workflow.</strong>
+            <div style={styles.errorDetail}>{error}</div>
           </div>
         )}
       </section>
@@ -449,10 +569,7 @@ export default function HomePage() {
   );
 }
 
-const styles: Record<
-  string,
-  React.CSSProperties
-> = {
+const styles: Record<string, React.CSSProperties> = {
   page: {
     minHeight: "100vh",
     background: "#07090d",
@@ -460,8 +577,7 @@ const styles: Record<
     padding: "48px 24px",
     position: "relative",
     overflow: "hidden",
-    fontFamily:
-      "Arial, Helvetica, sans-serif",
+    fontFamily: "Arial, Helvetica, sans-serif",
   },
 
   backgroundGlow: {
@@ -502,8 +618,7 @@ const styles: Record<
   title: {
     margin: 0,
     maxWidth: 760,
-    fontSize:
-      "clamp(36px, 6vw, 68px)",
+    fontSize: "clamp(36px, 6vw, 68px)",
     lineHeight: 0.98,
     letterSpacing: "-0.045em",
   },
@@ -531,13 +646,11 @@ const styles: Record<
   },
 
   card: {
-    background:
-      "rgba(15, 18, 25, 0.90)",
+    background: "rgba(15, 18, 25, 0.90)",
     border: "1px solid #252b36",
     borderRadius: 18,
     padding: 22,
-    boxShadow:
-      "0 20px 60px rgba(0, 0, 0, 0.18)",
+    boxShadow: "0 20px 60px rgba(0, 0, 0, 0.18)",
   },
 
   label: {
@@ -604,6 +717,11 @@ const styles: Record<
     boxSizing: "border-box",
   },
 
+  disabledBox: {
+    opacity: 0.55,
+    cursor: "not-allowed",
+  },
+
   uploadIcon: {
     width: 34,
     height: 34,
@@ -664,18 +782,102 @@ const styles: Record<
     fontSize: 14,
     fontWeight: 800,
     cursor: "pointer",
-    minWidth: 170,
+    minWidth: 190,
+  },
+
+  buttonDisabled: {
+    opacity: 0.55,
+    cursor: "wait",
+  },
+
+  projectPanel: {
+    marginTop: 20,
+    padding: 16,
+    borderRadius: 12,
+    border: "1px solid #252b36",
+    background: "#0d1016",
+  },
+
+  projectLabel: {
+    color: "#737d8d",
+    fontSize: 10,
+    letterSpacing: "0.15em",
+    fontWeight: 700,
+  },
+
+  projectId: {
+    marginTop: 6,
+    color: "#aeb6c5",
+    fontSize: 12,
+    fontFamily: "monospace",
+    wordBreak: "break-all",
+  },
+
+  renderingPanel: {
+    marginTop: 20,
+    padding: 20,
+    borderRadius: 14,
+    border: "1px solid #39305d",
+    background: "#110f1e",
+    display: "flex",
+    alignItems: "center",
+    gap: 16,
+  },
+
+  spinner: {
+    width: 22,
+    height: 22,
+    borderRadius: "50%",
+    border: "3px solid #353044",
+    borderTopColor: "#8a7cff",
+    animation: "spin 1s linear infinite",
   },
 
   success: {
     marginTop: 20,
-    padding: 16,
-    borderRadius: 12,
+    padding: 20,
+    borderRadius: 14,
     border: "1px solid #344436",
     background: "#101812",
     color: "#c9d7cb",
     fontSize: 14,
     lineHeight: 1.6,
+  },
+
+  successActions: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    marginTop: 16,
+    flexWrap: "wrap",
+  },
+
+  downloadButton: {
+    border: 0,
+    borderRadius: 10,
+    padding: "12px 18px",
+    background: "#f4f5f7",
+    color: "#080a0e",
+    fontSize: 13,
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+
+  videoLink: {
+    color: "#bdb6ff",
+    fontSize: 13,
+    fontWeight: 700,
+    textDecoration: "none",
+  },
+
+  info: {
+    marginTop: 20,
+    padding: 16,
+    borderRadius: 12,
+    border: "1px solid #303744",
+    background: "#0d1016",
+    color: "#b8c0ce",
+    fontSize: 14,
   },
 
   error: {
@@ -689,30 +891,9 @@ const styles: Record<
     lineHeight: 1.6,
   },
 
-  videoActions: {
-    display: "flex",
-    gap: 10,
-    marginTop: 14,
-    flexWrap: "wrap",
-  },
-
-  videoLink: {
-    display: "inline-block",
-    border: "1px solid #394150",
-    borderRadius: 9,
-    padding: "10px 14px",
-    color: "#dfe4ec",
-    textDecoration: "none",
-    fontWeight: 700,
-  },
-
-  downloadLink: {
-    display: "inline-block",
-    borderRadius: 9,
-    padding: "10px 14px",
-    background: "#f4f5f7",
-    color: "#080a0e",
-    textDecoration: "none",
-    fontWeight: 800,
+  errorDetail: {
+    marginTop: 8,
+    color: "#c9aeb3",
+    wordBreak: "break-word",
   },
 };
