@@ -21,9 +21,16 @@ cors_origins = [
     if origin.strip()
 ]
 
+# Vercel creates deployment-specific *.vercel.app hostnames. A fixed
+# CORS_ORIGINS list therefore breaks direct browser-to-Render uploads whenever
+# the frontend is opened from a new deployment URL. Keep explicit origins for
+# configured hosts, while allowing only this application's Vercel hostnames.
+vercel_origin_regex = r"^https://ai-live-video-maker(?:-[a-z0-9-]+)*\.vercel\.app$"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
+    allow_origin_regex=vercel_origin_regex,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
