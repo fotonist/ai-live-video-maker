@@ -1,60 +1,62 @@
 "use client";
 
-import { ChangeEvent, FormEvent, type CSSProperties, useEffect, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 
 const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL ?? "").replace(/\/$/, "");
 
-type RenderStatus = "idle" | "rendering" | "completed" | "failed";
-type RenderPhase = "preparing" | "scenes" | "scene-concat" | "audio-mux" | "completed" | "failed" | "idle";
-
-type ApiError = { detail?: string };
-type ProjectResponse = { id: string; status?: string; name?: string };
-type RenderResponse = {
-  project_id: string;
+type JobStatus = {
+  id: string;
   status: string;
-  video_url?: string;
-  width?: number;
-  height?: number;
-  duration_seconds?: number;
-  format?: string;
-  error?: string | null;
-  phase?: RenderPhase;
+  phase: string;
   message?: string;
-  scene_current?: number;
-  scene_total?: number;
+  video_url?: string;
+  error?: string | null;
 };
 
+type ApiError = { detail?: string };
+
+type StepKey = "upload" | "motion" | "lipsync" | "final";
+
+const steps: Array<{ key: StepKey; title: string; detail: string }> = [
+  { key: "upload", title: "Source prepared", detail: "Singer image and vocal are uploaded." },
+  { key: "motion", title: "Performance generated", detail: "Kling creates natural performer motion." },
+  { key: "lipsync", title: "Lip sync", detail: "The mouth is synchronized to the singing." },
+  { key: "final", title: "Video ready", detail: "The finished singing performance is available." },
+];
+
+function phaseIndex(status: JobStatus | null): number {
+  if (!status) return -1;
+  if (status.status === "completed") return 3;
+  if (status.status === "failed") return -1;
+  const phase = (status.phase || "").toLowerCase();
+  if (phase.includes("lip") || phase.includes("sync")) return 2;
+  if (phase.includes("video") || phase.includes("motion") || phase.includes("animate")) return 1;
+  return 0;
+}
+
 export default function HomePage() {
-  const [projectName, setProjectName] = useState("");
-  const [lyrics, setLyrics] = useState("");
-  const [audioFile, setAudioFile] = useState<File | null>(null);
-  const [format, setFormat] = useState("9:16");
-  const [singer, setSinger] = useState("Female");
-  const [projectId, setProjectId] = useState("");
-  const [statusMessage, setStatusMessage] = useState("");
+  const [image, setImage] = useState<File | null>(null);
+  const [audio, setAudio] = useState<File | null>(null);
+  const [jobId, setJobId] = useState("");
+  const [status, setStatus] = useState<JobStatus | null>(null);
   const [error, setError] = useState("");
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [renderStatus, setRenderStatus] = useState<RenderStatus>("idle");
-  const [renderPhase, setRenderPhase] = useState<RenderPhase>("idle");
-  const [renderMessage, setRenderMessage] = useState("");
-  const [sceneCurrent, setSceneCurrent] = useState(0);
-  const [sceneTotal, setSceneTotal] = useState(0);
-  const [renderError, setRenderError] = useState("");
-  const [videoUrl, setVideoUrl] = useState("");
-  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [dragOver, setDragOver] = useState<"image" | "audio" | null>(null);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => () => {
-    if (pollTimer.current) clearTimeout(pollTimer.current);
+    if (pollRef.current) clearTimeout(pollRef.current);
   }, []);
 
-  function apiBase(): string {
-    if (!backendUrl) throw new Error("NEXT_PUBLIC_BACKEND_URL is not configured.");
-    return backendUrl;
-  }
+  const imagePreview = useMemo(() => (image ? URL.createObjectURL(image) : ""), [image]);
 
-  async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(`${apiBase()}${path}`, options);
+  useEffect(() => () => {
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+  }, [imagePreview]);
+
+  async function request<T>(path: string, options?: RequestInit): Promise<T> {
+    if (!backendUrl) throw new Error("NEXT_PUBLIC_BACKEND_URL is not configured.");
+    const response = await fetch(`${backendUrl}${path}`, options);
     const data = (await response.json().catch(() => null)) as T | ApiError | null;
     if (!response.ok) {
       const detail = data && typeof data === "object" && "detail" in data ? data.detail : undefined;
@@ -63,339 +65,301 @@ export default function HomePage() {
     return data as T;
   }
 
-  function handleAudioChange(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0] ?? null;
-    if (file && !file.type.startsWith("audio/")) {
-      setAudioFile(null);
-      setError("Please select an MP3 or WAV audio file.");
+  function acceptImage(file: File | null) {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("Please choose a JPG, PNG or WEBP image.");
       return;
     }
-    if (file && file.size > 100 * 1024 * 1024) {
-      setAudioFile(null);
-      setError("Audio files must be 100 MB or smaller.");
+    if (file.size > 15 * 1024 * 1024) {
+      setError("Singer images must be 15 MB or smaller.");
       return;
     }
+    setImage(file);
     setError("");
-    setAudioFile(file);
   }
 
-  async function createProjectAndUploadAudio(): Promise<string> {
-    if (!projectName.trim()) throw new Error("Project name is required.");
-    if (!lyrics.trim()) throw new Error("Lyrics are required.");
-    if (!audioFile) throw new Error("Please upload an MP3 or WAV file.");
-
-    setStatusMessage("Creating project...");
-    const project = await apiFetch<ProjectResponse>("/projects", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: projectName.trim(), lyrics, format, singer, audio_file_name: audioFile.name }),
-    });
-
-    const id = project.id;
-    setProjectId(id);
-    setStatusMessage("Project created. Uploading audio...");
-
-    const uploadForm = new FormData();
-    uploadForm.append("file", audioFile, audioFile.name);
-    const uploadResponse = await fetch(`${apiBase()}/projects/${id}/audio`, { method: "POST", body: uploadForm });
-    const uploadData = (await uploadResponse.json().catch(() => null)) as { filename?: string; detail?: string } | null;
-    if (!uploadResponse.ok) throw new Error(uploadData?.detail || "Audio upload failed.");
-    setStatusMessage(`Audio uploaded${uploadData?.filename ? `: ${uploadData.filename}` : "."}`);
-    return id;
-  }
-
-  async function analyzeProject(id: string) {
-    setStatusMessage("Analyzing audio...");
-    await apiFetch(`/projects/${id}/analyze`, { method: "POST" });
-  }
-
-  async function createStoryboard(id: string) {
-    setStatusMessage("Building storyboard...");
-    await apiFetch(`/projects/${id}/storyboard`, { method: "POST" });
-  }
-
-  async function startRender(id: string) {
-    setStatusMessage("Starting video render...");
-    setRenderStatus("rendering");
-    setRenderPhase("preparing");
-    setRenderMessage("Preparing render...");
-    setSceneCurrent(0);
-    setSceneTotal(0);
-    setRenderError("");
-    setVideoUrl("");
-    await apiFetch<RenderResponse>(`/projects/${id}/render?output_format=${encodeURIComponent(format)}`, { method: "POST" });
-  }
-
-  async function pollRenderStatus(id: string) {
-    try {
-      const data = await apiFetch<RenderResponse>(`/projects/${id}/render/status`);
-      const phase = data.phase ?? (data.status === "completed" ? "completed" : data.status === "failed" ? "failed" : "preparing");
-      setRenderPhase(phase);
-      setRenderMessage(data.message || "Rendering video...");
-      setSceneCurrent(data.scene_current ?? 0);
-      setSceneTotal(data.scene_total ?? 0);
-
-      if (data.status === "completed") {
-        setRenderStatus("completed");
-        const relativeVideoUrl = data.video_url || `/projects/${id}/video`;
-        setVideoUrl(relativeVideoUrl.startsWith("http") ? relativeVideoUrl : `${apiBase()}${relativeVideoUrl}`);
-        setStatusMessage("Video rendering completed.");
-        setIsProcessing(false);
-        return;
-      }
-
-      if (data.status === "failed") {
-        setRenderStatus("failed");
-        setRenderPhase("failed");
-        setRenderError(data.error || "Video rendering failed.");
-        setStatusMessage("");
-        setIsProcessing(false);
-        return;
-      }
-
-      setRenderStatus("rendering");
-      setStatusMessage(data.message || "Rendering video...");
-      pollTimer.current = setTimeout(() => void pollRenderStatus(id), 2500);
-    } catch (pollError) {
-      console.warn("Render status check failed temporarily:", pollError);
-      setRenderStatus("rendering");
-      setRenderMessage("Connection interrupted. Checking render status again...");
-      pollTimer.current = setTimeout(() => void pollRenderStatus(id), 5000);
+  function acceptAudio(file: File | null) {
+    if (!file) return;
+    if (!file.type.startsWith("audio/")) {
+      setError("Please choose an audio file.");
+      return;
     }
+    if (file.size > 50 * 1024 * 1024) {
+      setError("Singing audio must be 50 MB or smaller.");
+      return;
+    }
+    setAudio(file);
+    setError("");
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  function selectImage(event: ChangeEvent<HTMLInputElement>) {
+    acceptImage(event.target.files?.[0] ?? null);
+  }
+
+  function selectAudio(event: ChangeEvent<HTMLInputElement>) {
+    acceptAudio(event.target.files?.[0] ?? null);
+  }
+
+  function handleDrop(kind: "image" | "audio", event: React.DragEvent<HTMLLabelElement>) {
     event.preventDefault();
-    if (isSubmitting || isProcessing) return;
+    setDragOver(null);
+    const file = event.dataTransfer.files?.[0] ?? null;
+    if (kind === "image") acceptImage(file);
+    else acceptAudio(file);
+  }
 
-    setError("");
-    setRenderError("");
-    setStatusMessage("");
-    setProjectId("");
-    setVideoUrl("");
-    setRenderStatus("idle");
-    setRenderPhase("idle");
-    setSceneCurrent(0);
-    setSceneTotal(0);
-    setIsSubmitting(true);
-    setIsProcessing(true);
-
+  async function poll(id: string) {
     try {
-      const id = await createProjectAndUploadAudio();
-      await analyzeProject(id);
-      await createStoryboard(id);
-      await startRender(id);
-      await pollRenderStatus(id);
-    } catch (submitError) {
-      setIsProcessing(false);
-      setRenderStatus("failed");
-      setRenderPhase("failed");
-      setError(submitError instanceof Error ? submitError.message : "Project creation failed.");
-    } finally {
-      setIsSubmitting(false);
+      const data = await request<JobStatus>(`/singing-test/${id}`);
+      setStatus(data);
+      if (data.status === "completed" || data.status === "failed") return;
+      pollRef.current = setTimeout(() => void poll(id), 3000);
+    } catch (pollError) {
+      setError(pollError instanceof Error ? pollError.message : "Status check failed.");
+      pollRef.current = setTimeout(() => void poll(id), 5000);
     }
   }
 
-  function downloadVideo() {
-    if (!videoUrl) return;
-    const link = document.createElement("a");
-    link.href = videoUrl;
-    link.download = `${projectName.trim() || "ai-live-video"}.mp4`;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!image || !audio || submitting) return;
+
+    setError("");
+    setStatus(null);
+    setJobId("");
+    setSubmitting(true);
+
+    try {
+      const form = new FormData();
+      form.append("image", image, image.name);
+      form.append("audio", audio, audio.name);
+      const created = await request<JobStatus>("/singing-test", { method: "POST", body: form });
+      setJobId(created.id);
+      setStatus(created);
+      await poll(created.id);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Singing video generation failed.");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
-  const scenesDone = renderStatus === "completed" || renderPhase === "scene-concat" || renderPhase === "audio-mux";
-  const concatDone = renderStatus === "completed" || renderPhase === "audio-mux";
-  const muxDone = renderStatus === "completed";
-
-  const stepState = (step: "scenes" | "concat" | "mux") => {
-    if (renderStatus === "completed") return "done";
-    if (step === "scenes") return scenesDone ? "done" : renderPhase === "scenes" || renderPhase === "preparing" ? "active" : "pending";
-    if (step === "concat") return concatDone ? "done" : renderPhase === "scene-concat" ? "active" : "pending";
-    return muxDone ? "done" : renderPhase === "audio-mux" ? "active" : "pending";
-  };
+  const videoUrl = status?.status === "completed" && jobId ? `${backendUrl}/singing-test/${jobId}/video` : "";
+  const currentStep = phaseIndex(status);
+  const isRunning = Boolean(status && status.status !== "completed" && status.status !== "failed");
+  const balanceError = /balance not enough|account balance/i.test(error || status?.error || "");
 
   return (
     <main style={styles.page}>
-      <div style={styles.backgroundGlow} />
+      <div style={styles.ambientOne} />
+      <div style={styles.ambientTwo} />
+
       <section style={styles.shell}>
         <header style={styles.header}>
           <div>
-            <div style={styles.eyebrow}>AI LIVE VIDEO MAKER</div>
-            <h1 style={styles.title}>Turn a song into a live performance.</h1>
-            <p style={styles.subtitle}>Upload your music and lyrics. Build an AI-generated concert video from one workflow.</p>
+            <div style={styles.brand}>AI LIVE VIDEO MAKER</div>
+            <div style={styles.productLine}>
+              <span style={styles.liveDot} />
+              SINGING PERFORMANCE STUDIO
+            </div>
+            <h1 style={styles.title}>Make the singer<br />actually sing.</h1>
+            <p style={styles.subtitle}>
+              Give us a singer image and the vocal track. The production pipeline creates performer motion first, then synchronizes the mouth to the actual singing.
+            </p>
           </div>
-          <div style={styles.status}>
-            {renderStatus === "rendering" ? "Rendering" : renderStatus === "completed" ? "Completed" : "Ready"}
-          </div>
+          <div style={styles.badge}>KLING POWERED</div>
         </header>
 
-        <form onSubmit={handleSubmit} style={styles.form}>
-          <div style={styles.card}>
-            <label style={styles.label} htmlFor="project-name">Project name</label>
-            <input id="project-name" value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="My Concert Video" style={styles.input} disabled={isSubmitting || isProcessing} required />
-          </div>
-
-          <div style={styles.card}>
-            <label style={styles.label} htmlFor="lyrics">Lyrics</label>
-            <textarea id="lyrics" value={lyrics} onChange={(event) => setLyrics(event.target.value)} placeholder="Paste your song lyrics here..." style={styles.textarea} rows={9} disabled={isSubmitting || isProcessing} required />
-            <div style={styles.helper}>{lyrics.length} characters</div>
-          </div>
-
-          <div style={styles.grid}>
-            <div style={styles.card}>
-              <label style={styles.label} htmlFor="audio">Music</label>
-              <label htmlFor="audio" style={{ ...styles.uploadBox, ...(isSubmitting || isProcessing ? styles.disabledBox : {}) }}>
-                <span style={styles.uploadIcon}>↑</span>
-                <strong>{audioFile ? audioFile.name : "Upload MP3 or WAV"}</strong>
-                <span style={styles.helper}>MP3/WAV · maximum 100 MB</span>
-              </label>
-              <input id="audio" type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/*" onChange={handleAudioChange} style={styles.hiddenInput} disabled={isSubmitting || isProcessing} />
-            </div>
-
-            <div style={styles.card}>
-              <label style={styles.label}>Output format</label>
-              <div style={styles.optionRow}>
-                {["9:16", "16:9"].map((option) => <button key={option} type="button" onClick={() => setFormat(option)} style={{ ...styles.option, ...(format === option ? styles.optionActive : {}) }} disabled={isSubmitting || isProcessing}>{option}</button>)}
+        <form onSubmit={submit}>
+          <div style={styles.uploadGrid}>
+            <label
+              htmlFor="singer-image"
+              style={{ ...styles.uploadCard, ...(dragOver === "image" ? styles.uploadActive : {}) }}
+              onDragOver={(event) => { event.preventDefault(); setDragOver("image"); }}
+              onDragLeave={() => setDragOver(null)}
+              onDrop={(event) => handleDrop("image", event)}
+            >
+              <input id="singer-image" type="file" accept="image/jpeg,image/png,image/webp" onChange={selectImage} style={styles.hidden} disabled={submitting} />
+              <div style={styles.cardTop}>
+                <span style={styles.number}>01</span>
+                <span style={styles.cardLabel}>SINGER IMAGE</span>
               </div>
-              <label style={{ ...styles.label, marginTop: 24 }}>Singer</label>
-              <div style={styles.optionRow}>
-                {["Female", "Male"].map((option) => <button key={option} type="button" onClick={() => setSinger(option)} style={{ ...styles.option, ...(singer === option ? styles.optionActive : {}) }} disabled={isSubmitting || isProcessing}>{option}</button>)}
+              {imagePreview ? (
+                <div style={styles.imageSelected}>
+                  <img src={imagePreview} alt="Singer preview" style={styles.imagePreview} />
+                  <div style={styles.selectedInfo}>
+                    <strong>{image.name}</strong>
+                    <span>Image ready</span>
+                  </div>
+                </div>
+              ) : (
+                <div style={styles.emptyUpload}>
+                  <div style={styles.uploadIcon}>+</div>
+                  <strong>Drop a singer image here</strong>
+                  <span>or click to browse · JPG / PNG / WEBP · max 15 MB</span>
+                </div>
+              )}
+            </label>
+
+            <label
+              htmlFor="singing-audio"
+              style={{ ...styles.uploadCard, ...(dragOver === "audio" ? styles.uploadActive : {}) }}
+              onDragOver={(event) => { event.preventDefault(); setDragOver("audio"); }}
+              onDragLeave={() => setDragOver(null)}
+              onDrop={(event) => handleDrop("audio", event)}
+            >
+              <input id="singing-audio" type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/aac,audio/*" onChange={selectAudio} style={styles.hidden} disabled={submitting} />
+              <div style={styles.cardTop}>
+                <span style={styles.number}>02</span>
+                <span style={styles.cardLabel}>SINGING AUDIO</span>
               </div>
-            </div>
+              {audio ? (
+                <div style={styles.audioSelected}>
+                  <div style={styles.audioIcon}>♪</div>
+                  <div style={styles.selectedInfo}>
+                    <strong>{audio.name}</strong>
+                    <span>Vocal track ready</span>
+                  </div>
+                </div>
+              ) : (
+                <div style={styles.emptyUpload}>
+                  <div style={styles.audioBig}>♪</div>
+                  <strong>Drop the vocal track here</strong>
+                  <span>or click to browse · MP3 / WAV / M4A / AAC · max 50 MB</span>
+                </div>
+              )}
+            </label>
           </div>
 
-          <div style={styles.footer}>
+          <div style={styles.controlBar}>
             <div>
-              <div style={styles.footerTitle}>{renderStatus === "rendering" ? "Rendering in progress" : renderStatus === "completed" ? "Video ready" : "Ready to create"}</div>
-              <div style={styles.helper}>{renderStatus === "rendering" ? renderMessage || "The page checks the render status automatically." : renderStatus === "completed" ? "Your MP4 video is ready." : "Create → Analyze → Storyboard → Render."}</div>
+              <div style={styles.controlTitle}>10-second performance proof of concept</div>
+              <div style={styles.controlHint}>9:16 vertical · moving performer · synchronized singing</div>
             </div>
-            <button type="submit" style={{ ...styles.primaryButton, ...(isSubmitting || isProcessing ? styles.buttonDisabled : {}) }} disabled={isSubmitting || isProcessing}>
-              {isSubmitting ? "Creating..." : isProcessing ? "Rendering..." : "Create & Render"}<span>→</span>
+            <button type="submit" disabled={!image || !audio || submitting} style={{ ...styles.primary, ...(!image || !audio || submitting ? styles.primaryDisabled : {}) }}>
+              {submitting ? "Starting performance…" : "Create Singing Video"}
+              <span style={styles.arrow}>→</span>
             </button>
           </div>
         </form>
 
-        {projectId && <div style={styles.projectPanel}><div style={styles.projectLabel}>PROJECT</div><div style={styles.projectId}>{projectId}</div></div>}
-
-        {renderStatus === "rendering" && (
-          <div style={styles.renderingPanel} role="status">
-            <div style={styles.renderHeader}>
+        {(status || error) && (
+          <section style={styles.generation} role="status">
+            <div style={styles.generationHeader}>
               <div>
-                <div style={styles.renderTitle}>Rendering video...</div>
-                <div style={styles.renderMessage}>{renderMessage || "Preparing render..."}</div>
+                <div style={styles.sectionEyebrow}>LIVE GENERATION</div>
+                <h2 style={styles.generationTitle}>
+                  {status?.status === "completed" ? "Performance ready." : status?.status === "failed" ? "Generation stopped." : "Building the performance…"}
+                </h2>
               </div>
-              <div style={styles.sceneCounter}>{sceneTotal > 0 ? `${sceneCurrent}/${sceneTotal}` : "…"}</div>
+              {status?.phase && <div style={styles.phasePill}>{status.phase.replaceAll("_", " ")}</div>}
             </div>
 
-            <div style={styles.progressTrack}>
-              <div style={{ ...styles.progressBar, width: `${sceneTotal > 0 ? Math.min(100, (sceneCurrent / sceneTotal) * 100) : 3}%` }} />
+            <div style={styles.timeline}>
+              {steps.map((step, index) => {
+                const done = status?.status === "completed" || currentStep > index;
+                const active = isRunning && currentStep === index;
+                return (
+                  <div key={step.key} style={styles.timelineItem}>
+                    <div style={{ ...styles.timelineMark, ...(done ? styles.timelineDone : {}), ...(active ? styles.timelineActive : {}) }}>
+                      {done ? "✓" : index + 1}
+                    </div>
+                    <div style={styles.timelineText}>
+                      <strong>{step.title}</strong>
+                      <span>{active ? (status?.message || step.detail) : step.detail}</span>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
 
-            <div style={styles.checklist}>
-              <RenderStep done active={false} label="Project created" detail="Project is ready." />
-              <RenderStep done active={false} label="Audio uploaded" detail="Source audio is available." />
-              <RenderStep done active={false} label="Audio analyzed" detail="Timing and energy analysis completed." />
-              <RenderStep done active={false} label="Storyboard built" detail="Scenes are ready for rendering." />
-              <RenderStep done={stepState("scenes") === "done"} active={stepState("scenes") === "active"} label="Rendering scenes" detail={sceneTotal > 0 ? `Scene ${Math.min(sceneCurrent + 1, sceneTotal)} of ${sceneTotal}` : "Preparing scenes..."} />
-              <RenderStep done={stepState("concat") === "done"} active={stepState("concat") === "active"} label="Concatenating scenes" detail={stepState("concat") === "active" ? "Joining completed scene videos..." : "Waiting for all scenes."} />
-              <RenderStep done={stepState("mux") === "done"} active={stepState("mux") === "active"} label="Adding audio & finalizing MP4" detail={stepState("mux") === "active" ? "Muxing audio and finalizing the file..." : "Waiting for visual render."} />
-            </div>
-          </div>
+            {status?.status === "failed" && (status.error || error) && (
+              <div style={{ ...styles.errorPanel, ...(balanceError ? styles.balancePanel : {}) }}>
+                <strong>{balanceError ? "Kling API balance required" : "Generation error"}</strong>
+                <div>{status.error || error}</div>
+                {balanceError && <span style={styles.errorHint}>The application reached Kling successfully. Add API credits to the Kling account and run the same test again.</span>}
+              </div>
+            )}
+
+            {error && !status?.error && status?.status !== "failed" && <div style={styles.errorPanel}><strong>Connection error</strong><div>{error}</div></div>}
+
+            {videoUrl && (
+              <div style={styles.result}>
+                <div style={styles.resultHeader}>
+                  <div>
+                    <div style={styles.sectionEyebrow}>FINAL OUTPUT</div>
+                    <strong style={styles.resultTitle}>Singing performance</strong>
+                  </div>
+                  <a href={videoUrl} download="singing-performance.mp4" style={styles.download}>Download MP4 ↓</a>
+                </div>
+                <video src={videoUrl} controls playsInline style={styles.video} />
+              </div>
+            )}
+          </section>
         )}
 
-        {renderStatus === "completed" && videoUrl && (
-          <div style={styles.success} role="status">
-            <strong>Video is ready.</strong>
-            <div style={styles.successActions}>
-              <button type="button" onClick={downloadVideo} style={styles.downloadButton}>Download Video</button>
-              <a href={videoUrl} target="_blank" rel="noopener noreferrer" style={styles.videoLink}>Open Video</a>
-            </div>
-          </div>
-        )}
-
-        {renderStatus === "failed" && (renderError || error) && (
-          <div style={styles.error} role="alert">
-            <strong>Rendering failed.</strong>
-            <div style={styles.errorDetail}>{renderError || error}</div>
-          </div>
-        )}
-
-        {statusMessage && renderStatus !== "rendering" && <div style={styles.info} role="status">{statusMessage}</div>}
+        <footer style={styles.footer}>
+          <span>IMAGE → MOTION → LIP SYNC → VIDEO</span>
+          <span>10s PoC</span>
+        </footer>
       </section>
     </main>
   );
 }
 
-function RenderStep({ done, active, label, detail }: { done: boolean; active: boolean; label: string; detail: string }) {
-  return (
-    <div style={styles.step}>
-      <div style={{ ...styles.stepIcon, ...(done ? styles.stepDone : active ? styles.stepActive : styles.stepPending) }}>{done ? "✓" : active ? "●" : "○"}</div>
-      <div style={styles.stepBody}>
-        <div style={styles.stepLabel}>{label}</div>
-        <div style={styles.stepDetail}>{detail}</div>
-      </div>
-      {active && <div style={styles.live}>LIVE</div>}
-    </div>
-  );
-}
-
 const styles: Record<string, CSSProperties> = {
-  page: { minHeight: "100vh", background: "#07090d", color: "#f5f7fa", padding: "48px 24px", position: "relative", overflow: "hidden", fontFamily: "Arial, Helvetica, sans-serif" },
-  backgroundGlow: { position: "absolute", width: 520, height: 520, borderRadius: "50%", background: "radial-gradient(circle, rgba(105, 80, 255, 0.20), transparent 68%)", top: -240, right: -140, pointerEvents: "none" },
-  shell: { width: "100%", maxWidth: 1080, margin: "0 auto", position: "relative" },
-  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 24, marginBottom: 40 },
-  eyebrow: { fontSize: 12, letterSpacing: "0.18em", fontWeight: 700, color: "#9ea7b7", marginBottom: 14 },
-  title: { margin: 0, maxWidth: 760, fontSize: "clamp(36px, 6vw, 68px)", lineHeight: 0.98, letterSpacing: "-0.045em" },
-  subtitle: { maxWidth: 650, color: "#a8b0bf", fontSize: 17, lineHeight: 1.6, margin: "20px 0 0" },
-  status: { border: "1px solid #29303d", borderRadius: 999, padding: "8px 13px", color: "#aeb6c5", fontSize: 12, whiteSpace: "nowrap" },
-  form: { display: "grid", gap: 18 },
-  card: { background: "rgba(15, 18, 25, 0.90)", border: "1px solid #252b36", borderRadius: 18, padding: 22, boxShadow: "0 20px 60px rgba(0, 0, 0, 0.18)" },
-  label: { display: "block", fontSize: 13, fontWeight: 700, color: "#dce1e9", marginBottom: 10 },
-  input: { width: "100%", boxSizing: "border-box", background: "#0a0d12", color: "#fff", border: "1px solid #303744", borderRadius: 11, padding: "14px 15px", fontSize: 15, outline: "none" },
-  textarea: { width: "100%", boxSizing: "border-box", resize: "vertical", background: "#0a0d12", color: "#fff", border: "1px solid #303744", borderRadius: 11, padding: 15, fontSize: 15, lineHeight: 1.6, outline: "none", fontFamily: "inherit" },
-  helper: { color: "#737d8d", fontSize: 12, lineHeight: 1.5, marginTop: 8 },
-  grid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 18 },
-  uploadBox: { minHeight: 130, border: "1px dashed #394150", borderRadius: 13, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", cursor: "pointer", color: "#dfe4ec", padding: 18, boxSizing: "border-box" },
-  disabledBox: { opacity: 0.55, cursor: "not-allowed" },
-  uploadIcon: { width: 34, height: 34, borderRadius: "50%", display: "grid", placeItems: "center", border: "1px solid #394150", marginBottom: 10, color: "#aab3c2", fontSize: 18 },
-  hiddenInput: { display: "none" },
-  optionRow: { display: "flex", gap: 10 },
-  option: { flex: 1, border: "1px solid #303744", background: "#0a0d12", color: "#aeb6c5", borderRadius: 10, padding: "12px 14px", cursor: "pointer", fontWeight: 700 },
-  optionActive: { borderColor: "#7c6cff", color: "#fff", background: "#19152f" },
-  footer: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 20, padding: "22px 2px 4px" },
-  footerTitle: { fontSize: 15, fontWeight: 700 },
-  primaryButton: { border: 0, borderRadius: 11, padding: "14px 22px", background: "#f4f5f7", color: "#080a0e", fontSize: 14, fontWeight: 800, cursor: "pointer", minWidth: 190 },
-  buttonDisabled: { opacity: 0.55, cursor: "wait" },
-  projectPanel: { marginTop: 20, padding: 16, borderRadius: 12, border: "1px solid #252b36", background: "#0d1016" },
-  projectLabel: { color: "#737d8d", fontSize: 10, letterSpacing: "0.15em", fontWeight: 700 },
-  projectId: { marginTop: 6, color: "#aeb6c5", fontSize: 12, fontFamily: "monospace", wordBreak: "break-all" },
-  renderingPanel: { marginTop: 20, padding: 22, borderRadius: 16, border: "1px solid #39305d", background: "#110f1e" },
-  renderHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 20 },
-  renderTitle: { fontSize: 17, fontWeight: 800 },
-  renderMessage: { color: "#aeb6c5", fontSize: 13, marginTop: 6 },
-  sceneCounter: { fontFamily: "monospace", fontSize: 15, color: "#c8c1ff", fontWeight: 800 },
-  progressTrack: { height: 6, background: "#29243b", borderRadius: 999, overflow: "hidden", marginTop: 20 },
-  progressBar: { height: "100%", background: "#8a7cff", borderRadius: 999, transition: "width 0.4s ease" },
-  checklist: { marginTop: 20, display: "grid", gap: 4 },
-  step: { display: "flex", alignItems: "center", gap: 13, minHeight: 52, padding: "7px 8px", borderBottom: "1px solid #24202f" },
-  stepIcon: { width: 27, height: 27, borderRadius: "50%", display: "grid", placeItems: "center", flex: "0 0 27px", fontSize: 13, fontWeight: 900 },
-  stepDone: { background: "#19341f", color: "#83d99a", border: "1px solid #315b3b" },
-  stepActive: { background: "#2a2350", color: "#c9c2ff", border: "1px solid #6558b5" },
-  stepPending: { background: "#15131c", color: "#555064", border: "1px solid #302c3a" },
-  stepBody: { minWidth: 0, flex: 1 },
-  stepLabel: { fontSize: 13, fontWeight: 750, color: "#e0ddeb" },
-  stepDetail: { color: "#747083", fontSize: 11, marginTop: 3 },
-  live: { color: "#a99fff", fontSize: 9, fontWeight: 900, letterSpacing: "0.12em" },
-  success: { marginTop: 20, padding: 20, borderRadius: 14, border: "1px solid #344436", background: "#101812", color: "#c9d7cb", fontSize: 14, lineHeight: 1.6 },
-  successActions: { display: "flex", alignItems: "center", gap: 12, marginTop: 16, flexWrap: "wrap" },
-  downloadButton: { border: 0, borderRadius: 10, padding: "12px 18px", background: "#f4f5f7", color: "#080a0e", fontSize: 13, fontWeight: 800, cursor: "pointer" },
-  videoLink: { color: "#bdb6ff", fontSize: 13, fontWeight: 700, textDecoration: "none" },
-  info: { marginTop: 20, padding: 16, borderRadius: 12, border: "1px solid #303744", background: "#0d1016", color: "#b8c0ce", fontSize: 14 },
-  error: { marginTop: 20, padding: 16, borderRadius: 12, border: "1px solid #5b3030", background: "#1b0f11", color: "#e5c4c8", fontSize: 14, lineHeight: 1.6 },
-  errorDetail: { marginTop: 8, color: "#c9aeb3", wordBreak: "break-word" },
+  page: { minHeight: "100vh", background: "#060b12", color: "#f1f5f9", padding: "48px 24px 30px", position: "relative", overflow: "hidden", fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif" },
+  ambientOne: { position: "fixed", width: 520, height: 520, borderRadius: "50%", background: "rgba(41, 105, 214, .14)", filter: "blur(110px)", top: -260, right: -160, pointerEvents: "none" },
+  ambientTwo: { position: "fixed", width: 440, height: 440, borderRadius: "50%", background: "rgba(30, 190, 160, .06)", filter: "blur(120px)", bottom: -250, left: -160, pointerEvents: "none" },
+  shell: { maxWidth: 1180, margin: "0 auto", position: "relative" },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 30, marginBottom: 38 },
+  brand: { fontSize: 12, fontWeight: 900, letterSpacing: 2.4, color: "#8ca4c2", marginBottom: 12 },
+  productLine: { display: "flex", alignItems: "center", gap: 8, fontSize: 11, fontWeight: 800, letterSpacing: 1.6, color: "#5ee0c1", marginBottom: 16 },
+  liveDot: { width: 7, height: 7, borderRadius: "50%", background: "#5ee0c1", boxShadow: "0 0 14px rgba(94,224,193,.65)" },
+  title: { fontSize: "clamp(42px, 6vw, 74px)", lineHeight: .96, letterSpacing: -2.8, margin: 0, maxWidth: 820, fontWeight: 850 },
+  subtitle: { color: "#8799ae", fontSize: 16, lineHeight: 1.65, maxWidth: 720, margin: "20px 0 0" },
+  badge: { border: "1px solid #28425d", color: "#9cb6d2", borderRadius: 999, padding: "9px 13px", fontSize: 10, fontWeight: 900, letterSpacing: 1.3, whiteSpace: "nowrap" },
+  uploadGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 },
+  uploadCard: { minHeight: 290, background: "rgba(12, 21, 33, .88)", border: "1px solid #20354c", borderRadius: 20, padding: 24, display: "flex", flexDirection: "column", cursor: "pointer", transition: "border-color .2s, background .2s" },
+  uploadActive: { borderColor: "#4f8cff", background: "rgba(18, 36, 58, .96)" },
+  hidden: { display: "none" },
+  cardTop: { display: "flex", alignItems: "center", gap: 10, marginBottom: 20 },
+  number: { color: "#55708f", fontSize: 11, fontWeight: 900, letterSpacing: 1 },
+  cardLabel: { color: "#a9bbcf", fontSize: 11, fontWeight: 900, letterSpacing: 1.5 },
+  emptyUpload: { flex: 1, border: "1px dashed #36506c", borderRadius: 15, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, textAlign: "center", color: "#cbd6e2" },
+  uploadIcon: { width: 42, height: 42, borderRadius: "50%", display: "grid", placeItems: "center", background: "#14263a", color: "#75a7ff", fontSize: 27, fontWeight: 300 },
+  audioBig: { width: 42, height: 42, borderRadius: "50%", display: "grid", placeItems: "center", background: "#14263a", color: "#5ee0c1", fontSize: 22 },
+  emptyUpload: { flex: 1, border: "1px dashed #36506c", borderRadius: 15, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, textAlign: "center", color: "#cbd6e2" },
+  imageSelected: { flex: 1, borderRadius: 15, background: "#0a1420", border: "1px solid #28435d", display: "flex", alignItems: "center", justifyContent: "center", gap: 20, padding: 18 },
+  imagePreview: { width: 112, height: 155, objectFit: "cover", borderRadius: 12, border: "1px solid #36516c" },
+  selectedInfo: { display: "flex", flexDirection: "column", gap: 7, maxWidth: 230, overflow: "hidden" },
+  audioSelected: { flex: 1, borderRadius: 15, background: "#0a1420", border: "1px solid #28435d", display: "flex", alignItems: "center", justifyContent: "center", gap: 18, padding: 25 },
+  audioIcon: { width: 64, height: 64, borderRadius: "50%", display: "grid", placeItems: "center", background: "#12312f", color: "#5ee0c1", fontSize: 31 },
+  controlBar: { marginTop: 18, background: "#0b1725", border: "1px solid #20384f", borderRadius: 18, padding: 18, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 22 },
+  controlTitle: { fontWeight: 800, fontSize: 14, marginBottom: 5 },
+  controlHint: { color: "#71859c", fontSize: 12 },
+  primary: { border: 0, borderRadius: 12, background: "#4f8cff", color: "white", padding: "15px 21px", fontWeight: 900, fontSize: 14, cursor: "pointer", boxShadow: "0 8px 30px rgba(79,140,255,.18)", whiteSpace: "nowrap" },
+  primaryDisabled: { opacity: .42, cursor: "not-allowed", boxShadow: "none" },
+  arrow: { marginLeft: 12, fontSize: 18 },
+  generation: { marginTop: 24, background: "#09131f", border: "1px solid #20384f", borderRadius: 20, padding: 24 },
+  generationHeader: { display: "flex", justifyContent: "space-between", gap: 20, alignItems: "flex-start", marginBottom: 25 },
+  sectionEyebrow: { fontSize: 10, fontWeight: 900, letterSpacing: 1.8, color: "#6785a4", marginBottom: 7 },
+  generationTitle: { margin: 0, fontSize: 28, letterSpacing: -.7 },
+  phasePill: { border: "1px solid #294764", color: "#7faeff", borderRadius: 999, padding: "8px 11px", fontSize: 10, fontWeight: 900, letterSpacing: 1, textTransform: "uppercase" },
+  timeline: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 0, position: "relative" },
+  timelineItem: { position: "relative", display: "flex", gap: 12, paddingRight: 16, minHeight: 74 },
+  timelineMark: { flex: "0 0 28px", width: 28, height: 28, borderRadius: "50%", border: "1px solid #2a435d", display: "grid", placeItems: "center", color: "#607991", fontSize: 11, fontWeight: 900, background: "#0a1521", position: "relative", zIndex: 1 },
+  timelineDone: { background: "#12312e", borderColor: "#347c70", color: "#5ee0c1" },
+  timelineActive: { background: "#162e50", borderColor: "#4f8cff", color: "#83b0ff", boxShadow: "0 0 0 5px rgba(79,140,255,.08)" },
+  timelineText: { display: "flex", flexDirection: "column", gap: 5 },
+  result: { marginTop: 26, borderTop: "1px solid #1b3146", paddingTop: 22 },
+  resultHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 20, marginBottom: 15 },
+  resultTitle: { fontSize: 18 },
+  download: { color: "#8db7ff", textDecoration: "none", fontWeight: 800, fontSize: 12 },
+  video: { display: "block", width: "min(430px, 100%)", maxHeight: "72vh", margin: "0 auto", borderRadius: 15, background: "#000", border: "1px solid #253c54" },
+  errorPanel: { marginTop: 18, border: "1px solid #693847", background: "#1b1015", color: "#ffbdca", borderRadius: 14, padding: 16, display: "flex", flexDirection: "column", gap: 8, lineHeight: 1.5, fontSize: 13 },
+  balancePanel: { borderColor: "#6d5533", background: "#1b160f", color: "#f2cf94" },
+  errorHint: { color: "#b9a27d", fontSize: 12 },
+  footer: { marginTop: 26, display: "flex", justifyContent: "space-between", color: "#4f647a", fontSize: 10, fontWeight: 900, letterSpacing: 1.3 },
 };
