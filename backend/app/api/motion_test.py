@@ -48,8 +48,6 @@ def _render(job_dir: Path) -> None:
     width, height = 1080, 1920
     movie_path = str(image.resolve()).replace("\\", "/").replace("'", "\\'")
 
-    # No AI and no video-generation API: the uploaded still becomes a moving
-    # shot through a slow zoom and smooth sinusoidal camera drift.
     visual_filter = (
         f"movie='{movie_path}':loop=1,"
         f"scale={int(width * 1.18)}:{int(height * 1.18)}:force_original_aspect_ratio=increase,"
@@ -70,16 +68,26 @@ def _render(job_dir: Path) -> None:
         "motion visual",
     )
 
+    if not visual.exists() or visual.stat().st_size == 0:
+        raise RuntimeError("Motion visual was not created")
+
+    # Re-encode the video during mux instead of stream-copying it. This avoids
+    # failures when FFmpeg cannot see the generated visual stream as 0:v:0.
     _run(
         [
             ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
             "-i", str(visual), "-i", str(audio),
-            "-map", "0:v:0", "-map", "1:a:0", "-t", str(DURATION),
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            "-map", "0:v", "-map", "1:a:0",
+            "-t", str(DURATION),
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
             "-shortest", "-movflags", "+faststart", str(final),
         ],
         "audio mux",
     )
+
+    if not final.exists() or final.stat().st_size == 0:
+        raise RuntimeError("Final motion-test video was not created")
 
 
 def _job(job_id: UUID) -> None:
