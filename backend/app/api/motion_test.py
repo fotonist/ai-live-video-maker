@@ -33,7 +33,33 @@ def _run(command: list[str], label: str) -> None:
     result = run(command, stdout=PIPE, stderr=PIPE, check=False)
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"FFmpeg {label} failed: {detail[-2500:]}")
+        raise RuntimeError(f"FFmpeg {label} failed: {detail[-3000:]}")
+
+
+def _validate_video(ffmpeg: str, video: Path) -> None:
+    """Force FFmpeg to decode both streams; this is our portable ffprobe check."""
+    result = run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-i",
+            str(video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-f",
+            "null",
+            "-",
+        ],
+        stdout=PIPE,
+        stderr=PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Generated MP4 validation failed: {detail[-3000:]}")
 
 
 def _render(job_dir: Path) -> None:
@@ -45,13 +71,10 @@ def _render(job_dir: Path) -> None:
 
     final = job_dir / "video.mp4"
     width, height = 1080, 1920
-    movie_path = str(image.resolve()).replace("\\", "/").replace("'", "\\'")
 
-    # Keep the whole render in one FFmpeg process. The previous two-pass
-    # approach could create an MP4 container that existed on disk but exposed
-    # no readable video stream to the second FFmpeg invocation.
+    # Generate the moving image and mux the uploaded audio in ONE FFmpeg
+    # invocation. No intermediate MP4 is created.
     visual_filter = (
-        f"movie='{movie_path}':loop=1,"
         f"scale={int(width * 1.18)}:{int(height * 1.18)}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height}:"
         "x='(iw-ow)/2+sin(t*0.24)*((iw-ow)*0.16)':"
@@ -67,6 +90,12 @@ def _render(job_dir: Path) -> None:
             "-hide_banner",
             "-loglevel",
             "error",
+            "-loop",
+            "1",
+            "-framerate",
+            "30",
+            "-i",
+            str(image),
             "-i",
             str(audio),
             "-filter_complex",
@@ -74,7 +103,7 @@ def _render(job_dir: Path) -> None:
             "-map",
             "[v]",
             "-map",
-            "0:a:0",
+            "1:a:0",
             "-t",
             str(DURATION),
             "-c:v",
@@ -97,8 +126,14 @@ def _render(job_dir: Path) -> None:
         "motion video + audio",
     )
 
-    if not final.exists() or final.stat().st_size == 0:
-        raise RuntimeError("Final motion-test video was not created")
+    if not final.exists() or final.stat().st_size < 1024:
+        raise RuntimeError("Final motion-test video was not created correctly")
+
+    _validate_video(ffmpeg, final)
+    print(
+        f"[motion-test] validated id={job_dir.name} bytes={final.stat().st_size}",
+        flush=True,
+    )
 
 
 def _job(job_id: UUID) -> None:
