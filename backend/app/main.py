@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.motion_test import router as motion_test_router
 from app.api.projects import router as projects_router
 from app.api.render import recover_interrupted_renders, router as render_router
+from app.api.singing_test import router as singing_test_router
 from app.api.storyboard import router as storyboard_router
 from app.db import get_engine
 from app.models import Base
@@ -38,6 +39,7 @@ app.include_router(projects_router)
 app.include_router(storyboard_router)
 app.include_router(render_router)
 app.include_router(motion_test_router)
+app.include_router(singing_test_router)
 
 
 @app.on_event("startup")
