@@ -225,19 +225,24 @@ def _concat_scenes(
     """
     Concatenate already-rendered scene MP4 files.
 
-    All scenes are produced with identical resolution,
-    codec, pixel format and frame rate, so the concat
-    demuxer can copy the video streams without another
-    expensive video encode.
+    Absolute paths are deliberately written into concat.txt.
+    FFmpeg's concat demuxer resolves relative paths against
+    the directory containing concat.txt, which would otherwise
+    duplicate the uploads/projects/... prefix.
     """
+
+    concat_file = concat_file.resolve()
+    video_path = video_path.resolve()
 
     with concat_file.open(
         "w",
         encoding="utf-8",
     ) as file:
         for scene_path in scene_paths:
+            absolute_scene_path = scene_path.resolve()
+
             escaped = (
-                str(scene_path)
+                str(absolute_scene_path)
                 .replace("\\", "/")
                 .replace("'", "'\\''")
             )
@@ -478,10 +483,6 @@ def _render_video_job(
             flush=True,
         )
 
-        # ---------------------------------------------------------
-        # STEP 1 — Render each scene independently
-        # ---------------------------------------------------------
-
         for index, scene in enumerate(scenes):
             scene_path = (
                 project_dir
@@ -514,10 +515,6 @@ def _render_video_job(
                 flush=True,
             )
 
-        # ---------------------------------------------------------
-        # STEP 2 — Concatenate visual scenes
-        # ---------------------------------------------------------
-
         concat_file = (
             project_dir / "concat.txt"
         )
@@ -538,10 +535,6 @@ def _render_video_job(
             project_id=project_id,
         )
 
-        # ---------------------------------------------------------
-        # STEP 3 — Add original audio
-        # ---------------------------------------------------------
-
         _mux_audio(
             video_path=visual_video,
             audio_path=audio_path,
@@ -550,10 +543,6 @@ def _render_video_job(
             ffmpeg=ffmpeg,
             project_id=project_id,
         )
-
-        # ---------------------------------------------------------
-        # STEP 4 — Validate final MP4
-        # ---------------------------------------------------------
 
         if not video_path.exists():
             raise RuntimeError(
@@ -566,10 +555,6 @@ def _render_video_job(
             raise RuntimeError(
                 "Final video file is empty"
             )
-
-        # ---------------------------------------------------------
-        # STEP 5 — Mark DB as rendered
-        # ---------------------------------------------------------
 
         project = db.get(
             Project,
@@ -594,10 +579,6 @@ def _render_video_job(
             f"scenes={len(scenes)}",
             flush=True,
         )
-
-        # ---------------------------------------------------------
-        # STEP 6 — Remove intermediate files
-        # ---------------------------------------------------------
 
         for scene_path in scene_paths:
             scene_path.unlink(
