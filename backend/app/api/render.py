@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db, get_session_factory
 from app.models import Project
+from app.services.scene_planner import plan_scenes
+from app.services.visual_provider import build_visual_filter
 
 router = APIRouter(prefix="/projects", tags=["render"])
 PROJECT_ROOT = Path("uploads") / "projects"
@@ -74,13 +76,18 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
         temp_video_path.unlink(missing_ok=True)
         video_path.unlink(missing_ok=True)
 
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         duration = max(float(project.analysis.duration_seconds), 0.1)
+        scenes = plan_scenes(
+            duration_seconds=duration,
+            sections=project.analysis.sections or [],
+            energy_curve=project.analysis.energy_curve or [],
+        )
+        if not scenes:
+            raise RuntimeError("Scene planner produced no renderable scenes")
 
-        # Render one video frame per second. The source is a static color frame,
-        # so this keeps CPU/RAM usage substantially lower than 24/30 fps rendering.
-        # IMPORTANT: the temporary filename ends in .part, so explicitly specify
-        # the MP4 muxer with -f mp4. Otherwise FFmpeg cannot infer the container.
+        visual_filter = build_visual_filter(scenes, width, height)
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
         command = [
             ffmpeg,
             "-y",
@@ -88,24 +95,20 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
             "-hide_banner",
             "-loglevel",
             "error",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c=0x0b1020:s={width}x{height}:r=1",
+            "-filter_complex",
+            visual_filter,
             "-i",
             str(audio_path),
             "-map",
-            "0:v:0",
+            "[vout]",
             "-map",
-            "1:a:0",
+            "0:a:0",
             "-t",
             f"{duration:.3f}",
             "-c:v",
             "libx264",
             "-preset",
             "ultrafast",
-            "-tune",
-            "stillimage",
             "-threads",
             "1",
             "-crf",
@@ -123,6 +126,10 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
             str(temp_video_path),
         ]
 
+        print(
+            f"[render] starting project={project_id} scenes={len(scenes)} duration={duration:.3f}s format={output_format}",
+            flush=True,
+        )
         result = run(command, stdout=PIPE, stderr=PIPE, check=False)
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
 
@@ -139,7 +146,7 @@ def _render_video_job(project_id: UUID, output_format: str) -> None:
         db.add(project)
         db.commit()
         print(
-            f"[render] completed project={project_id} size={video_path.stat().st_size} bytes duration={duration:.3f}s",
+            f"[render] completed project={project_id} size={video_path.stat().st_size} bytes duration={duration:.3f}s scenes={len(scenes)}",
             flush=True,
         )
 
