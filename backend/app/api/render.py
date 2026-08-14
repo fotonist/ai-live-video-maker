@@ -14,6 +14,7 @@ from app.services.scene_planner import plan_scenes
 from app.services.visual_provider import build_visual_filter
 
 router = APIRouter(prefix="/projects", tags=["render"])
+
 PROJECT_ROOT = Path("uploads") / "projects"
 
 
@@ -30,199 +31,743 @@ class RenderResponse(BaseModel):
 
 def _audio_path(project: Project) -> Path:
     if project.audio is None:
-        raise HTTPException(status_code=409, detail="Audio upload is required before rendering")
+        raise HTTPException(
+            status_code=409,
+            detail="Audio upload is required before rendering",
+        )
+
     path = Path(project.audio.storage_path)
+
     if not path.exists():
-        raise HTTPException(status_code=404, detail="Audio file not found for project")
+        raise HTTPException(
+            status_code=404,
+            detail="Audio file not found for project",
+        )
+
     return path
 
 
 def _dimensions(output_format: str) -> tuple[int, int]:
-    return (1920, 1080) if output_format == "16:9" else (1080, 1920)
+    if output_format == "16:9":
+        return 1920, 1080
+
+    return 1080, 1920
 
 
 def recover_interrupted_renders() -> None:
-    """Mark renders interrupted by a process restart as failed."""
+    """
+    Mark renders interrupted by a process restart as failed.
+
+    This prevents the frontend from polling a permanently stuck
+    'rendering' state after the Render service restarts.
+    """
+
     SessionLocal = get_session_factory()
     db = SessionLocal()
+
     try:
-        projects = db.query(Project).filter(Project.status == "rendering").all()
+        projects = (
+            db.query(Project)
+            .filter(Project.status == "rendering")
+            .all()
+        )
+
         for project in projects:
             project.status = "render_failed"
             db.add(project)
+
         if projects:
             db.commit()
+
     finally:
         db.close()
 
 
-def _render_video_job(project_id: UUID, output_format: str) -> None:
+def _run_ffmpeg(
+    command: list[str],
+    project_id: UUID,
+    label: str,
+) -> None:
+    """
+    Execute FFmpeg and raise a useful error when it fails.
+    """
+
+    print(
+        f"[render] ffmpeg start project={project_id} step={label}",
+        flush=True,
+    )
+
+    result = run(
+        command,
+        stdout=PIPE,
+        stderr=PIPE,
+        check=False,
+    )
+
+    stderr = result.stderr.decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
+
+    if result.returncode != 0:
+        print(
+            f"[render] FFmpeg failed "
+            f"project={project_id} "
+            f"step={label}: "
+            f"{stderr[-4000:]}",
+            flush=True,
+        )
+
+        raise RuntimeError(
+            f"FFmpeg failed during {label}: "
+            f"{stderr[-1500:]}"
+        )
+
+
+def _render_scene(
+    *,
+    scene,
+    scene_index: int,
+    width: int,
+    height: int,
+    scene_path: Path,
+    ffmpeg: str,
+    project_id: UUID,
+) -> None:
+    """
+    Render exactly one visual scene.
+
+    Rendering scenes independently is intentional:
+    it prevents a 55-scene / 248-second project from
+    creating one enormous FFmpeg filter graph and
+    dramatically reduces peak RAM usage.
+    """
+
+    duration = max(
+        float(scene.end - scene.start),
+        0.1,
+    )
+
+    visual_filter = build_visual_filter(
+        [scene],
+        width,
+        height,
+    )
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+
+        "-filter_complex",
+        visual_filter,
+
+        "-map",
+        "[vout]",
+
+        "-t",
+        f"{duration:.3f}",
+
+        "-an",
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "ultrafast",
+
+        "-threads",
+        "1",
+
+        "-crf",
+        "30",
+
+        "-pix_fmt",
+        "yuv420p",
+
+        "-movflags",
+        "+faststart",
+
+        "-f",
+        "mp4",
+
+        str(scene_path),
+    ]
+
+    _run_ffmpeg(
+        command,
+        project_id,
+        f"scene-{scene_index + 1}/{scene_index + 1}",
+    )
+
+    if not scene_path.exists():
+        raise RuntimeError(
+            f"Scene {scene_index + 1} was not created"
+        )
+
+    if scene_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"Scene {scene_index + 1} is empty"
+        )
+
+
+def _concat_scenes(
+    *,
+    scene_paths: list[Path],
+    concat_file: Path,
+    video_path: Path,
+    ffmpeg: str,
+    project_id: UUID,
+) -> None:
+    """
+    Concatenate already-rendered scene MP4 files.
+
+    All scenes are produced with identical resolution,
+    codec, pixel format and frame rate, so the concat
+    demuxer can copy the video streams without another
+    expensive video encode.
+    """
+
+    with concat_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        for scene_path in scene_paths:
+            escaped = (
+                str(scene_path)
+                .replace("\\", "/")
+                .replace("'", "'\\''")
+            )
+
+            file.write(
+                f"file '{escaped}'\n"
+            )
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+
+        "-f",
+        "concat",
+
+        "-safe",
+        "0",
+
+        "-i",
+        str(concat_file),
+
+        "-c",
+        "copy",
+
+        "-movflags",
+        "+faststart",
+
+        "-f",
+        "mp4",
+
+        str(video_path),
+    ]
+
+    _run_ffmpeg(
+        command,
+        project_id,
+        "scene-concat",
+    )
+
+    if not video_path.exists():
+        raise RuntimeError(
+            "Final concatenated video was not created"
+        )
+
+    if video_path.stat().st_size == 0:
+        raise RuntimeError(
+            "Final concatenated video is empty"
+        )
+
+
+def _mux_audio(
+    *,
+    video_path: Path,
+    audio_path: Path,
+    final_path: Path,
+    duration: float,
+    ffmpeg: str,
+    project_id: UUID,
+) -> None:
+    """
+    Add the original project audio to the already
+    concatenated visual video.
+
+    Video is copied. Only audio is encoded.
+    """
+
+    temp_final = final_path.with_name(
+        "video.final.mp4"
+    )
+
+    temp_final.unlink(missing_ok=True)
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+
+        "-i",
+        str(video_path),
+
+        "-i",
+        str(audio_path),
+
+        "-map",
+        "0:v:0",
+
+        "-map",
+        "1:a:0",
+
+        "-t",
+        f"{duration:.3f}",
+
+        "-c:v",
+        "copy",
+
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        "96k",
+
+        "-movflags",
+        "+faststart",
+
+        "-f",
+        "mp4",
+
+        str(temp_final),
+    ]
+
+    _run_ffmpeg(
+        command,
+        project_id,
+        "audio-mux",
+    )
+
+    if not temp_final.exists():
+        raise RuntimeError(
+            "Final video with audio was not created"
+        )
+
+    if temp_final.stat().st_size == 0:
+        raise RuntimeError(
+            "Final video with audio is empty"
+        )
+
+    temp_final.replace(final_path)
+
+
+def _render_video_job(
+    project_id: UUID,
+    output_format: str,
+) -> None:
+    """
+    Complete render pipeline.
+
+    Pipeline:
+
+        scene planner
+             ↓
+        scene 1 → MP4
+        scene 2 → MP4
+        ...
+        scene N → MP4
+             ↓
+        concat
+             ↓
+        audio mux
+             ↓
+        video.mp4
+             ↓
+        project.status = rendered
+    """
+
     SessionLocal = get_session_factory()
     db = SessionLocal()
-    temp_video_path: Path | None = None
+
+    project_dir: Path | None = None
+    scene_paths: list[Path] = []
+    concat_file: Path | None = None
+    video_path: Path | None = None
 
     try:
-        project = db.get(Project, project_id)
-        if project is None or project.analysis is None:
+        project = db.get(
+            Project,
+            project_id,
+        )
+
+        if project is None:
+            print(
+                f"[render] project not found: {project_id}",
+                flush=True,
+            )
             return
 
+        if project.analysis is None:
+            raise RuntimeError(
+                "Audio analysis is required before rendering"
+            )
+
         audio_path = _audio_path(project)
-        width, height = _dimensions(output_format)
-        project_dir = PROJECT_ROOT / str(project_id)
-        project_dir.mkdir(parents=True, exist_ok=True)
 
-        video_path = project_dir / "video.mp4"
-        temp_video_path = project_dir / "video.mp4.part"
-        temp_video_path.unlink(missing_ok=True)
-        video_path.unlink(missing_ok=True)
+        width, height = _dimensions(
+            output_format
+        )
 
-        duration = max(float(project.analysis.duration_seconds), 0.1)
+        project_dir = (
+            PROJECT_ROOT / str(project_id)
+        )
+
+        project_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        video_path = (
+            project_dir / "video.mp4"
+        )
+
+        video_path.unlink(
+            missing_ok=True
+        )
+
+        duration = max(
+            float(
+                project.analysis.duration_seconds
+            ),
+            0.1,
+        )
+
         scenes = plan_scenes(
             duration_seconds=duration,
             sections=project.analysis.sections or [],
             energy_curve=project.analysis.energy_curve or [],
         )
-        if not scenes:
-            raise RuntimeError("Scene planner produced no renderable scenes")
 
-        visual_filter = build_visual_filter(scenes, width, height)
+        if not scenes:
+            raise RuntimeError(
+                "Scene planner produced no renderable scenes"
+            )
+
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
-        command = [
-            ffmpeg,
-            "-y",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-filter_complex",
-            visual_filter,
-            "-i",
-            str(audio_path),
-            "-map",
-            "[vout]",
-            "-map",
-            "0:a:0",
-            "-t",
-            f"{duration:.3f}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-threads",
-            "1",
-            "-crf",
-            "30",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "96k",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-            str(temp_video_path),
-        ]
-
         print(
-            f"[render] starting project={project_id} scenes={len(scenes)} duration={duration:.3f}s format={output_format}",
+            f"[render] starting "
+            f"project={project_id} "
+            f"scenes={len(scenes)} "
+            f"duration={duration:.3f}s "
+            f"format={output_format} "
+            f"resolution={width}x{height}",
             flush=True,
         )
-        result = run(command, stdout=PIPE, stderr=PIPE, check=False)
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
 
-        if result.returncode != 0:
-            print(f"[render] FFmpeg failed for {project_id}: {stderr[-4000:]}", flush=True)
-            raise RuntimeError(f"FFmpeg render failed: {stderr[-1000:]}")
+        # ---------------------------------------------------------
+        # STEP 1 — Render each scene independently
+        # ---------------------------------------------------------
 
-        if not temp_video_path.exists() or temp_video_path.stat().st_size == 0:
-            raise RuntimeError("FFmpeg completed without producing a valid MP4")
+        for index, scene in enumerate(scenes):
+            scene_path = (
+                project_dir
+                / f"scene_{index:04d}.mp4"
+            )
 
-        temp_video_path.replace(video_path)
+            scene_path.unlink(
+                missing_ok=True
+            )
+
+            _render_scene(
+                scene=scene,
+                scene_index=index,
+                width=width,
+                height=height,
+                scene_path=scene_path,
+                ffmpeg=ffmpeg,
+                project_id=project_id,
+            )
+
+            scene_paths.append(
+                scene_path
+            )
+
+            print(
+                f"[render] scene "
+                f"{index + 1}/{len(scenes)} "
+                f"completed "
+                f"size={scene_path.stat().st_size}",
+                flush=True,
+            )
+
+        # ---------------------------------------------------------
+        # STEP 2 — Concatenate visual scenes
+        # ---------------------------------------------------------
+
+        concat_file = (
+            project_dir / "concat.txt"
+        )
+
+        visual_video = (
+            project_dir / "visual.mp4"
+        )
+
+        visual_video.unlink(
+            missing_ok=True
+        )
+
+        _concat_scenes(
+            scene_paths=scene_paths,
+            concat_file=concat_file,
+            video_path=visual_video,
+            ffmpeg=ffmpeg,
+            project_id=project_id,
+        )
+
+        # ---------------------------------------------------------
+        # STEP 3 — Add original audio
+        # ---------------------------------------------------------
+
+        _mux_audio(
+            video_path=visual_video,
+            audio_path=audio_path,
+            final_path=video_path,
+            duration=duration,
+            ffmpeg=ffmpeg,
+            project_id=project_id,
+        )
+
+        # ---------------------------------------------------------
+        # STEP 4 — Validate final MP4
+        # ---------------------------------------------------------
+
+        if not video_path.exists():
+            raise RuntimeError(
+                "Final video file does not exist"
+            )
+
+        final_size = video_path.stat().st_size
+
+        if final_size <= 0:
+            raise RuntimeError(
+                "Final video file is empty"
+            )
+
+        # ---------------------------------------------------------
+        # STEP 5 — Mark DB as rendered
+        # ---------------------------------------------------------
+
+        project = db.get(
+            Project,
+            project_id,
+        )
+
+        if project is None:
+            raise RuntimeError(
+                "Project disappeared before render completion"
+            )
 
         project.status = "rendered"
+
         db.add(project)
         db.commit()
+
         print(
-            f"[render] completed project={project_id} size={video_path.stat().st_size} bytes duration={duration:.3f}s scenes={len(scenes)}",
+            f"[render] completed "
+            f"project={project_id} "
+            f"size={final_size} bytes "
+            f"duration={duration:.3f}s "
+            f"scenes={len(scenes)}",
+            flush=True,
+        )
+
+        # ---------------------------------------------------------
+        # STEP 6 — Remove intermediate files
+        # ---------------------------------------------------------
+
+        for scene_path in scene_paths:
+            scene_path.unlink(
+                missing_ok=True
+            )
+
+        if concat_file is not None:
+            concat_file.unlink(
+                missing_ok=True
+            )
+
+        visual_video.unlink(
+            missing_ok=True
+        )
+
+        print(
+            f"[render] cleanup completed "
+            f"project={project_id}",
             flush=True,
         )
 
     except Exception as exc:
-        if temp_video_path is not None:
-            temp_video_path.unlink(missing_ok=True)
+        if project_dir is not None:
+            print(
+                f"[render] preserving failed render directory "
+                f"for diagnostics: {project_dir}",
+                flush=True,
+            )
 
-        project = db.get(Project, project_id)
+        project = db.get(
+            Project,
+            project_id,
+        )
+
         if project is not None:
             project.status = "render_failed"
             db.add(project)
             db.commit()
 
-        print(f"[render] failed project={project_id}: {exc}", flush=True)
+        print(
+            f"[render] failed "
+            f"project={project_id}: {exc}",
+            flush=True,
+        )
 
     finally:
         db.close()
 
 
-@router.post("/{project_id}/render", response_model=RenderResponse, status_code=202)
+@router.post(
+    "/{project_id}/render",
+    response_model=RenderResponse,
+    status_code=202,
+)
 def render_project(
     project_id: UUID,
     background_tasks: BackgroundTasks,
     output_format: str = "9:16",
     db: Session = Depends(get_db),
 ) -> RenderResponse:
-    project = db.get(Project, project_id)
+
+    project = db.get(
+        Project,
+        project_id,
+    )
 
     if project is None:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found",
+        )
+
     if project.analysis is None:
-        raise HTTPException(status_code=409, detail="Audio analysis is required before rendering")
-    if output_format not in {"9:16", "16:9"}:
-        raise HTTPException(status_code=422, detail="Output format must be 9:16 or 16:9")
+        raise HTTPException(
+            status_code=409,
+            detail="Audio analysis is required before rendering",
+        )
+
+    if output_format not in {
+        "9:16",
+        "16:9",
+    }:
+        raise HTTPException(
+            status_code=422,
+            detail="Output format must be 9:16 or 16:9",
+        )
+
     if project.status == "rendering":
-        raise HTTPException(status_code=409, detail="Video rendering is already in progress")
+        raise HTTPException(
+            status_code=409,
+            detail="Video rendering is already in progress",
+        )
 
     _audio_path(project)
-    width, height = _dimensions(output_format)
+
+    width, height = _dimensions(
+        output_format
+    )
 
     project.status = "rendering"
+
     db.add(project)
     db.commit()
 
-    background_tasks.add_task(_render_video_job, project_id, output_format)
+    background_tasks.add_task(
+        _render_video_job,
+        project_id,
+        output_format,
+    )
 
     return RenderResponse(
         project_id=project_id,
         status="rendering",
         width=width,
         height=height,
-        duration_seconds=round(project.analysis.duration_seconds, 3),
+        duration_seconds=round(
+            project.analysis.duration_seconds,
+            3,
+        ),
         format=output_format,
     )
 
 
-@router.get("/{project_id}/render/status", response_model=RenderResponse)
-def render_status(project_id: UUID, db: Session = Depends(get_db)) -> RenderResponse:
-    project = db.get(Project, project_id)
+@router.get(
+    "/{project_id}/render/status",
+    response_model=RenderResponse,
+)
+def render_status(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+) -> RenderResponse:
+
+    project = db.get(
+        Project,
+        project_id,
+    )
 
     if project is None:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found",
+        )
+
     if project.analysis is None:
-        raise HTTPException(status_code=409, detail="Audio analysis is required before rendering")
+        raise HTTPException(
+            status_code=409,
+            detail="Audio analysis is required before rendering",
+        )
 
     output_format = "9:16"
-    width, height = _dimensions(output_format)
+
+    width, height = _dimensions(
+        output_format
+    )
+
+    duration = round(
+        project.analysis.duration_seconds,
+        3,
+    )
 
     if project.status == "rendered":
         return RenderResponse(
             project_id=project_id,
             status="completed",
-            video_url=f"/projects/{project_id}/video",
+            video_url=(
+                f"/projects/{project_id}/video"
+            ),
             width=width,
             height=height,
-            duration_seconds=round(project.analysis.duration_seconds, 3),
+            duration_seconds=duration,
             format=output_format,
         )
 
@@ -232,9 +777,13 @@ def render_status(project_id: UUID, db: Session = Depends(get_db)) -> RenderResp
             status="failed",
             width=width,
             height=height,
-            duration_seconds=round(project.analysis.duration_seconds, 3),
+            duration_seconds=duration,
             format=output_format,
-            error="Video rendering failed. Check the Render service logs for the FFmpeg error.",
+            error=(
+                "Video rendering failed. "
+                "Check the Render service logs "
+                "for the FFmpeg error."
+            ),
         )
 
     return RenderResponse(
@@ -242,26 +791,53 @@ def render_status(project_id: UUID, db: Session = Depends(get_db)) -> RenderResp
         status="rendering",
         width=width,
         height=height,
-        duration_seconds=round(project.analysis.duration_seconds, 3),
+        duration_seconds=duration,
         format=output_format,
     )
 
 
-@router.get("/{project_id}/video")
-def get_rendered_video(project_id: UUID, db: Session = Depends(get_db)) -> FileResponse:
-    project = db.get(Project, project_id)
+@router.get(
+    "/{project_id}/video"
+)
+def get_rendered_video(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+
+    project = db.get(
+        Project,
+        project_id,
+    )
 
     if project is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if project.status != "rendered":
-        raise HTTPException(status_code=409, detail="Rendered video is not ready")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found",
+        )
 
-    video_path = PROJECT_ROOT / str(project_id) / "video.mp4"
+    if project.status != "rendered":
+        raise HTTPException(
+            status_code=409,
+            detail="Rendered video is not ready",
+        )
+
+    video_path = (
+        PROJECT_ROOT
+        / str(project_id)
+        / "video.mp4"
+    )
 
     if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Rendered video not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Rendered video not found",
+        )
+
     if video_path.stat().st_size == 0:
-        raise HTTPException(status_code=500, detail="Rendered video is empty")
+        raise HTTPException(
+            status_code=500,
+            detail="Rendered video is empty",
+        )
 
     return FileResponse(
         video_path,
