@@ -48,8 +48,8 @@ def _render(job_dir: Path) -> None:
     width, height = 1080, 1920
     movie_path = str(image.resolve()).replace("\\", "/").replace("'", "\\'")
 
-    # No AI, no video-generation API: the uploaded still is turned into a
-    # moving shot using a slow zoom plus sinusoidal horizontal/vertical drift.
+    # No AI and no video-generation API: the uploaded still becomes a moving
+    # shot through a slow zoom and smooth sinusoidal camera drift.
     visual_filter = (
         f"movie='{movie_path}':loop=1,"
         f"scale={int(width * 1.18)}:{int(height * 1.18)}:force_original_aspect_ratio=increase,"
@@ -110,8 +110,10 @@ async def create_motion_test(
     job_id = uuid4()
     job_dir = ROOT / str(job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
-    image_path = job_dir / f"image{_safe_extension(image.filename or "image", {'.jpg', '.jpeg', '.png', '.webp'}, '.jpg')}"
-    audio_path = job_dir / f"audio{_safe_extension(audio.filename or "audio", {'.mp3', '.wav'}, '.mp3')}"
+    image_ext = _safe_extension(image.filename or "image", {".jpg", ".jpeg", ".png", ".webp"}, ".jpg")
+    audio_ext = _safe_extension(audio.filename or "audio", {".mp3", ".wav"}, ".mp3")
+    image_path = job_dir / f"image{image_ext}"
+    audio_path = job_dir / f"audio{audio_ext}"
 
     try:
         image_size = 0
