@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
+import jwt
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -16,7 +17,7 @@ router = APIRouter(prefix="/singing-test", tags=["singing-test"])
 ROOT = Path("uploads") / "singing-tests"
 MAX_IMAGE_SIZE = 15 * 1024 * 1024
 MAX_AUDIO_SIZE = 5 * 1024 * 1024
-KLING_BASE_URL = "https://api.klingai.com/v1"
+KLING_BASE_URL = os.getenv("KLING_BASE_URL", "https://api.klingai.com/v1").rstrip("/")
 
 
 class SingingTestResponse(BaseModel):
@@ -28,15 +29,34 @@ class SingingTestResponse(BaseModel):
     error: str | None = None
 
 
-def _api_key() -> str:
-    value = os.getenv("KLING_API_KEY", "").strip()
-    if not value:
-        raise RuntimeError("KLING_API_KEY is not configured. Add a Kling API key to the Render service environment.")
-    return value
+def _kling_token() -> str:
+    access_key = os.getenv("KLING_ACCESS_KEY", "").strip()
+    secret_key = os.getenv("KLING_SECRET_KEY", "").strip()
+    if not access_key or not secret_key:
+        raise RuntimeError(
+            "KLING_ACCESS_KEY and KLING_SECRET_KEY are not configured. "
+            "Add both Kling credentials to the Render service environment."
+        )
+
+    now = int(time.time())
+    payload = {
+        "iss": access_key,
+        "exp": now + 1800,
+        "nbf": now - 5,
+    }
+    return jwt.encode(
+        payload,
+        secret_key,
+        algorithm="HS256",
+        headers={"alg": "HS256", "typ": "JWT"},
+    )
 
 
 def _headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"}
+    return {
+        "Authorization": f"Bearer {_kling_token()}",
+        "Content-Type": "application/json",
+    }
 
 
 def _write_status(job_dir: Path, status: str, phase: str, message: str = "") -> None:
@@ -71,7 +91,7 @@ def _extract_video(payload: dict) -> tuple[str, str]:
 
 
 def _kling_post(path: str, body: dict) -> dict:
-    with httpx.Client(timeout=60.0) as client:
+    with httpx.Client(timeout=90.0) as client:
         response = client.post(f"{KLING_BASE_URL}{path}", headers=_headers(), json=body)
     try:
         payload = response.json()
@@ -85,7 +105,7 @@ def _kling_post(path: str, body: dict) -> dict:
 
 
 def _kling_get(path: str) -> dict:
-    with httpx.Client(timeout=60.0) as client:
+    with httpx.Client(timeout=90.0) as client:
         response = client.get(f"{KLING_BASE_URL}{path}", headers=_headers())
     try:
         payload = response.json()
@@ -98,14 +118,19 @@ def _kling_get(path: str) -> dict:
     return payload
 
 
-def _poll_task(path: str, job_dir: Path, phase: str, timeout_seconds: int = 600) -> dict:
+def _poll_task(path: str, job_dir: Path, phase: str, timeout_seconds: int = 900) -> dict:
     started = time.monotonic()
     while time.monotonic() - started < timeout_seconds:
         payload = _kling_get(path)
         data = payload.get("data", {})
         state = str(data.get("task_status", "")).lower()
         message = str(data.get("task_status_msg", ""))
-        _write_status(job_dir, "rendering", phase, message or f"Kling {phase} is {state or 'processing'}...")
+        _write_status(
+            job_dir,
+            "rendering",
+            phase,
+            message or f"Kling {phase} is {state or 'processing'}...",
+        )
         if state == "succeed":
             return payload
         if state == "failed":
@@ -117,16 +142,24 @@ def _poll_task(path: str, job_dir: Path, phase: str, timeout_seconds: int = 600)
 def _run(job_id: UUID) -> None:
     job_dir = ROOT / str(job_id)
     try:
-        _write_status(job_dir, "rendering", "image-to-video", "Generating a live performance clip from the singer image...")
+        _write_status(
+            job_dir,
+            "rendering",
+            "image-to-video",
+            "Generating a live performance clip from the singer image...",
+        )
         image_path = next(job_dir.glob("image.*"))
         audio_path = next(job_dir.glob("audio.*"))
         image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
         audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
 
+        # Kling image-to-video accepts a Base64 image. The generated video is
+        # intentionally 10 seconds because the standard Lip Sync API accepts
+        # Kling-generated 5/10 second videos.
         i2v = _kling_post(
             "/videos/image2video",
             {
-                "model_name": os.getenv("KLING_VIDEO_MODEL", "kling-v1-6"),
+                "model_name": os.getenv("KLING_VIDEO_MODEL", "kling-v2-6"),
                 "image": image_b64,
                 "prompt": (
                     "A realistic live music performance. The singer performs naturally for the camera, "
@@ -135,17 +168,29 @@ def _run(job_id: UUID) -> None:
                     "Keep the face clearly visible and front-facing enough for accurate lip synchronization."
                 ),
                 "mode": "std",
-                "duration": 10,
+                "duration": "10",
                 "aspect_ratio": "9:16",
             },
         )
         i2v_task = _extract_task_id(i2v)
-        i2v_result = _poll_task(f"/videos/image2video/{i2v_task}", job_dir, "image-to-video")
+        i2v_result = _poll_task(
+            f"/videos/image2video/{i2v_task}",
+            job_dir,
+            "image-to-video",
+        )
         video_id, video_url = _extract_video(i2v_result)
         if not video_id and not video_url:
             raise RuntimeError("Kling image-to-video returned no video identifier or URL.")
 
-        _write_status(job_dir, "rendering", "lip-sync", "Synchronizing the singer's mouth to the uploaded vocal...")
+        _write_status(
+            job_dir,
+            "rendering",
+            "lip-sync",
+            "Synchronizing the singer's mouth to the uploaded vocal...",
+        )
+
+        # Official Kling Lip Sync contract: input.video_id OR input.video_url,
+        # mode=audio2video, audio_type=file, audio_file=Base64.
         lip_input: dict = {
             "mode": "audio2video",
             "audio_type": "file",
@@ -158,7 +203,11 @@ def _run(job_id: UUID) -> None:
 
         lip = _kling_post("/videos/lip-sync", {"input": lip_input})
         lip_task = _extract_task_id(lip)
-        lip_result = _poll_task(f"/videos/lip-sync/{lip_task}", job_dir, "lip-sync")
+        lip_result = _poll_task(
+            f"/videos/lip-sync/{lip_task}",
+            job_dir,
+            "lip-sync",
+        )
         _, final_url = _extract_video(lip_result)
         if not final_url:
             raise RuntimeError("Kling lip-sync completed without a video URL.")
@@ -218,7 +267,12 @@ async def create_singing_test(
 
     _write_status(job_dir, "queued", "queued", "Queued for Kling singing-video generation.")
     background_tasks.add_task(_run, job_id)
-    return SingingTestResponse(id=job_id, status="queued", phase="queued", message="Singing video test queued.")
+    return SingingTestResponse(
+        id=job_id,
+        status="queued",
+        phase="queued",
+        message="Singing video test queued.",
+    )
 
 
 @router.get("/{job_id}", response_model=SingingTestResponse)
@@ -227,8 +281,16 @@ def singing_test_status(job_id: UUID) -> SingingTestResponse:
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="Singing test not found.")
     status = _read_status(job_dir)
-    video_url = (job_dir / "video_url.txt").read_text(encoding="utf-8").strip() if (job_dir / "video_url.txt").exists() else ""
-    error = (job_dir / "error.txt").read_text(encoding="utf-8") if (job_dir / "error.txt").exists() else None
+    video_url = (
+        (job_dir / "video_url.txt").read_text(encoding="utf-8").strip()
+        if (job_dir / "video_url.txt").exists()
+        else ""
+    )
+    error = (
+        (job_dir / "error.txt").read_text(encoding="utf-8")
+        if (job_dir / "error.txt").exists()
+        else None
+    )
     return SingingTestResponse(
         id=job_id,
         status=status.get("status", "queued"),
@@ -253,8 +315,14 @@ def singing_test_video(job_id: UUID) -> StreamingResponse:
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream("GET", video_url) as response:
                 if response.status_code >= 400:
-                    raise RuntimeError(f"Kling video download failed with status {response.status_code}.")
+                    raise RuntimeError(
+                        f"Kling video download failed with status {response.status_code}."
+                    )
                 async for chunk in response.aiter_bytes(1024 * 1024):
                     yield chunk
 
-    return StreamingResponse(stream(), media_type="video/mp4", headers={"Content-Disposition": 'inline; filename="singing-test.mp4"'})
+    return StreamingResponse(
+        stream(),
+        media_type="video/mp4",
+        headers={"Content-Disposition": 'inline; filename="singing-test.mp4"'},
+    )
