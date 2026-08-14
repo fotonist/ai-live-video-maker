@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 
 const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL ?? "").replace(/\/$/, "");
 
@@ -67,7 +67,7 @@ export default function HomePage() {
   function handleDrop(kind: "image" | "audio", event: React.DragEvent<HTMLLabelElement>) {
     event.preventDefault(); setDragOver(null);
     const file = event.dataTransfer.files?.[0] ?? null;
-    if (kind === "image") acceptImage(file); else acceptAudio(file);
+    kind === "image" ? acceptImage(file) : acceptAudio(file);
   }
 
   async function poll(id: string) {
@@ -88,8 +88,7 @@ export default function HomePage() {
     setError(""); setStatus(null); setJobId(""); setSubmitting(true);
     try {
       const form = new FormData();
-      form.append("image", image, image.name);
-      form.append("audio", audio, audio.name);
+      form.append("image", image, image.name); form.append("audio", audio, audio.name);
       const created = await request<JobStatus>("/singing-test", { method: "POST", body: form });
       setJobId(created.id); setStatus(created); await poll(created.id);
     } catch (submitError) {
@@ -111,7 +110,7 @@ export default function HomePage() {
             <div style={styles.brand}>AI LIVE VIDEO MAKER</div>
             <div style={styles.productLine}><span style={styles.liveDot} /> SINGING PERFORMANCE STUDIO</div>
             <h1 style={styles.title}>Make the singer<br />actually sing.</h1>
-            <p style={styles.subtitle}>Give us a singer image and the vocal track. Kling creates performer motion first, then synchronizes the mouth to the actual singing.</p>
+            <p style={styles.subtitle}>Give us a singer image and the vocal track. The production pipeline creates performer motion first, then synchronizes the mouth to the actual singing.</p>
           </div>
           <div style={styles.badge}>KLING POWERED</div>
         </header>
@@ -119,26 +118,15 @@ export default function HomePage() {
         <form onSubmit={submit}>
           <div style={styles.uploadGrid}>
             <label htmlFor="singer-image" style={{ ...styles.uploadCard, ...(dragOver === "image" ? styles.uploadActive : {}) }} onDragOver={(e) => { e.preventDefault(); setDragOver("image"); }} onDragLeave={() => setDragOver(null)} onDrop={(e) => handleDrop("image", e)}>
-              <input id="singer-image" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e: ChangeEvent<HTMLInputElement>) => acceptImage(e.target.files?.[0] ?? null)} style={styles.hidden} disabled={submitting} />
+              <input id="singer-image" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => acceptImage(e.target.files?.[0] ?? null)} style={styles.hidden} disabled={submitting} />
               <div style={styles.cardTop}><span style={styles.number}>01</span><span style={styles.cardLabel}>SINGER IMAGE</span></div>
-              {imagePreview ? (
-                <div style={styles.imageSelected}>
-                  <img src={imagePreview} alt="Singer preview" style={styles.imagePreview} />
-                  <div style={styles.selectedInfo}><strong>{image?.name ?? "Selected image"}</strong><span>Image ready</span></div>
-                </div>
-              ) : (
-                <div style={styles.emptyUpload}><div style={styles.uploadIcon}>+</div><strong>Drop a singer image here</strong><span>or click to browse · JPG / PNG / WEBP · max 15 MB</span></div>
-              )}
+              {imagePreview ? <div style={styles.imageSelected}><img src={imagePreview} alt="Singer preview" style={styles.imagePreview} /><div style={styles.selectedInfo}><strong>{image?.name ?? "Selected image"}</strong><span>Image ready</span></div></div> : <div style={styles.emptyUpload}><div style={styles.uploadIcon}>+</div><strong>Drop a singer image here</strong><span>or click to browse · JPG / PNG / WEBP · max 15 MB</span></div>}
             </label>
 
             <label htmlFor="singing-audio" style={{ ...styles.uploadCard, ...(dragOver === "audio" ? styles.uploadActive : {}) }} onDragOver={(e) => { e.preventDefault(); setDragOver("audio"); }} onDragLeave={() => setDragOver(null)} onDrop={(e) => handleDrop("audio", e)}>
-              <input id="singing-audio" type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/aac,audio/*" onChange={(e: ChangeEvent<HTMLInputElement>) => acceptAudio(e.target.files?.[0] ?? null)} style={styles.hidden} disabled={submitting} />
+              <input id="singing-audio" type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/aac,audio/*" onChange={(e) => acceptAudio(e.target.files?.[0] ?? null)} style={styles.hidden} disabled={submitting} />
               <div style={styles.cardTop}><span style={styles.number}>02</span><span style={styles.cardLabel}>SINGING AUDIO</span></div>
-              {audio ? (
-                <div style={styles.audioSelected}><div style={styles.audioIcon}>♪</div><div style={styles.selectedInfo}><strong>{audio.name}</strong><span>Vocal track ready</span></div></div>
-              ) : (
-                <div style={styles.emptyUpload}><div style={styles.audioBig}>♪</div><strong>Drop the vocal track here</strong><span>or click to browse · MP3 / WAV / M4A / AAC · max 50 MB</span></div>
-              )}
+              {audio ? <div style={styles.audioSelected}><div style={styles.audioIcon}>♪</div><div style={styles.selectedInfo}><strong>{audio?.name ?? "Selected audio"}</strong><span>Vocal track ready</span></div></div> : <div style={styles.emptyUpload}><div style={styles.audioBig}>♪</div><strong>Drop the vocal track here</strong><span>or click to browse · MP3 / WAV / M4A / AAC · max 50 MB</span></div>}
             </label>
           </div>
 
@@ -170,7 +158,7 @@ const styles: Record<string, CSSProperties> = {
   header: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 30, marginBottom: 38 },
   brand: { fontSize: 12, fontWeight: 900, letterSpacing: 2.4, color: "#8ca4c2", marginBottom: 12 },
   productLine: { display: "flex", alignItems: "center", gap: 8, fontSize: 11, fontWeight: 800, letterSpacing: 1.6, color: "#5ee0c1", marginBottom: 16 },
-  liveDot: { width: 7, height: 7, borderRadius: "50%", background: "#5ee0c1" },
+  liveDot: { width: 7, height: 7, borderRadius: "50%", background: "#5ee0c1", boxShadow: "0 0 14px rgba(94,224,193,.65)" },
   title: { fontSize: "clamp(42px, 6vw, 74px)", lineHeight: .96, letterSpacing: -2.8, margin: 0, maxWidth: 820, fontWeight: 850 },
   subtitle: { color: "#8799ae", fontSize: 16, lineHeight: 1.65, maxWidth: 720, margin: "20px 0 0" },
   badge: { border: "1px solid #28425d", color: "#9cb6d2", borderRadius: 999, padding: "9px 13px", fontSize: 10, fontWeight: 900, letterSpacing: 1.3, whiteSpace: "nowrap" },
@@ -182,37 +170,38 @@ const styles: Record<string, CSSProperties> = {
   number: { color: "#55708f", fontSize: 11, fontWeight: 900, letterSpacing: 1 },
   cardLabel: { color: "#a9bbcf", fontSize: 11, fontWeight: 900, letterSpacing: 1.5 },
   emptyUpload: { flex: 1, border: "1px dashed #36506c", borderRadius: 15, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, textAlign: "center", color: "#cbd6e2" },
-  uploadIcon: { width: 42, height: 42, borderRadius: "50%", display: "grid", placeItems: "center", background: "#14263a", color: "#75a7ff", fontSize: 27 },
+  uploadIcon: { width: 42, height: 42, borderRadius: "50%", display: "grid", placeItems: "center", background: "#14263a", color: "#75a7ff", fontSize: 27, fontWeight: 300 },
   audioBig: { width: 42, height: 42, borderRadius: "50%", display: "grid", placeItems: "center", background: "#14263a", color: "#5ee0c1", fontSize: 22 },
   imageSelected: { flex: 1, borderRadius: 15, background: "#0a1420", border: "1px solid #28435d", display: "flex", alignItems: "center", justifyContent: "center", gap: 20, padding: 18 },
-  imagePreview: { width: 112, height: 155, objectFit: "cover", borderRadius: 12, border: "1px solid #36516c" },
-  selectedInfo: { display: "flex", flexDirection: "column", gap: 7, maxWidth: 230, overflow: "hidden" },
-  audioSelected: { flex: 1, borderRadius: 15, background: "#0a1420", border: "1px solid #28435d", display: "flex", alignItems: "center", justifyContent: "center", gap: 18, padding: 25 },
-  audioIcon: { width: 64, height: 64, borderRadius: "50%", display: "grid", placeItems: "center", background: "#12312f", color: "#5ee0c1", fontSize: 31 },
-  controlBar: { marginTop: 18, background: "#0b1725", border: "1px solid #20384f", borderRadius: 18, padding: 18, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 22 },
-  controlTitle: { fontWeight: 800, fontSize: 14, marginBottom: 5 },
-  controlHint: { color: "#71859c", fontSize: 12 },
-  primary: { border: 0, borderRadius: 12, background: "#4f8cff", color: "white", padding: "15px 21px", fontWeight: 900, fontSize: 14, cursor: "pointer", whiteSpace: "nowrap" },
-  primaryDisabled: { opacity: .42, cursor: "not-allowed" },
-  arrow: { marginLeft: 12, fontSize: 18 },
-  generation: { marginTop: 24, background: "#09131f", border: "1px solid #20384f", borderRadius: 20, padding: 24 },
-  generationHeader: { display: "flex", justifyContent: "space-between", gap: 20, alignItems: "flex-start", marginBottom: 25 },
-  sectionEyebrow: { fontSize: 10, fontWeight: 900, letterSpacing: 1.8, color: "#6785a4", marginBottom: 7 },
-  generationTitle: { margin: 0, fontSize: 28 },
-  phasePill: { border: "1px solid #294764", color: "#7faeff", borderRadius: 999, padding: "8px 11px", fontSize: 10, fontWeight: 900, letterSpacing: 1, textTransform: "uppercase" },
-  timeline: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 0 },
-  timelineItem: { display: "flex", gap: 12, paddingRight: 16, minHeight: 74 },
-  timelineMark: { flex: "0 0 28px", width: 28, height: 28, borderRadius: "50%", border: "1px solid #2a435d", display: "grid", placeItems: "center", color: "#607991", fontSize: 11, fontWeight: 900, background: "#0a1521" },
-  timelineDone: { background: "#12312e", borderColor: "#347c70", color: "#5ee0c1" },
-  timelineActive: { background: "#162e50", borderColor: "#4f8cff", color: "#83b0ff" },
+  imagePreview: { width: 112, height: 155, objectFit: "cover", borderRadius: 12 },
+  audioSelected: { flex: 1, borderRadius: 15, background: "#0a1420", border: "1px solid #28435d", display: "flex", alignItems: "center", gap: 16, padding: 24 },
+  audioIcon: { width: 54, height: 54, borderRadius: "50%", display: "grid", placeItems: "center", background: "#14263a", color: "#5ee0c1", fontSize: 26 },
+  selectedInfo: { display: "flex", flexDirection: "column", gap: 7, minWidth: 0 },
+  emptyUpload: { flex: 1, border: "1px dashed #36506c", borderRadius: 15, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, textAlign: "center", color: "#cbd6e2" },
+  controlBar: { marginTop: 18, border: "1px solid #20354c", background: "rgba(12,21,33,.75)", borderRadius: 18, padding: 18, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 20 },
+  controlTitle: { fontWeight: 800, color: "#dce7f2", fontSize: 14 },
+  controlHint: { color: "#6f849b", fontSize: 12, marginTop: 6 },
+  primary: { border: 0, borderRadius: 12, padding: "15px 20px", background: "#4f8cff", color: "white", fontWeight: 900, cursor: "pointer", display: "flex", gap: 20, alignItems: "center", fontSize: 13 },
+  primaryDisabled: { opacity: .45, cursor: "not-allowed" },
+  arrow: { fontSize: 20 },
+  generation: { marginTop: 24, border: "1px solid #20354c", background: "rgba(10,18,28,.9)", borderRadius: 20, padding: 24 },
+  generationHeader: { display: "flex", justifyContent: "space-between", gap: 20, alignItems: "flex-start" },
+  sectionEyebrow: { color: "#5ee0c1", fontSize: 10, fontWeight: 900, letterSpacing: 1.8 },
+  generationTitle: { margin: "8px 0 0", fontSize: 26 },
+  phasePill: { border: "1px solid #28425d", borderRadius: 999, padding: "8px 12px", color: "#a9bbcf", fontSize: 11, textTransform: "capitalize" },
+  timeline: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginTop: 24 },
+  timelineItem: { display: "flex", gap: 10, minWidth: 0 },
+  timelineMark: { flex: "0 0 auto", width: 28, height: 28, borderRadius: "50%", display: "grid", placeItems: "center", border: "1px solid #36506c", color: "#71869c", fontSize: 11, fontWeight: 900 },
+  timelineDone: { background: "#163c35", borderColor: "#2c7b6c", color: "#5ee0c1" },
+  timelineActive: { borderColor: "#4f8cff", color: "#75a7ff", boxShadow: "0 0 0 4px rgba(79,140,255,.08)" },
   timelineText: { display: "flex", flexDirection: "column", gap: 5 },
-  result: { marginTop: 26, borderTop: "1px solid #1b3146", paddingTop: 22 },
-  resultHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 20, marginBottom: 15 },
-  resultTitle: { fontSize: 18 },
-  download: { color: "#8db7ff", textDecoration: "none", fontWeight: 800, fontSize: 12 },
-  video: { display: "block", width: "min(430px, 100%)", maxHeight: "72vh", margin: "0 auto", borderRadius: 15, background: "#000", border: "1px solid #253c54" },
-  errorPanel: { marginTop: 18, border: "1px solid #693847", background: "#1b1015", color: "#ffbdca", borderRadius: 14, padding: 16, display: "flex", flexDirection: "column", gap: 8, lineHeight: 1.5, fontSize: 13 },
-  balancePanel: { borderColor: "#6d5533", background: "#1b160f", color: "#f2cf94" },
-  errorHint: { color: "#b9a27d", fontSize: 12 },
-  footer: { marginTop: 26, display: "flex", justifyContent: "space-between", color: "#4f647a", fontSize: 10, fontWeight: 900, letterSpacing: 1.3 },
+  errorPanel: { marginTop: 22, padding: 16, borderRadius: 12, border: "1px solid #713b45", background: "rgba(82,25,35,.25)", color: "#f1c7cf", display: "flex", flexDirection: "column", gap: 8 },
+  balancePanel: { borderColor: "#725d2f", background: "rgba(91,67,20,.22)" },
+  errorHint: { color: "#b7a982", fontSize: 12 },
+  result: { marginTop: 24 },
+  resultHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 20, marginBottom: 12 },
+  resultTitle: { display: "block", marginTop: 6 },
+  download: { color: "#9dc0ff", textDecoration: "none", fontSize: 12, fontWeight: 800 },
+  video: { width: "100%", maxHeight: "72vh", background: "#000", borderRadius: 14, display: "block" },
+  footer: { display: "flex", justifyContent: "space-between", color: "#4e6379", fontSize: 10, letterSpacing: 1.4, fontWeight: 800, marginTop: 30 },
 };
