@@ -196,56 +196,72 @@ export default function HomePage() {
     );
   }
 
-  async function pollRenderStatus(id: string) {
-    try {
-      const data = await apiFetch<RenderResponse>(
-        `/projects/${id}/render/status`,
+ async function pollRenderStatus(id: string) {
+  try {
+    const data = await apiFetch<RenderResponse>(
+      `/projects/${id}/render/status`,
+    );
+
+    if (data.status === "completed") {
+      setRenderStatus("completed");
+
+      const relativeVideoUrl =
+        data.video_url || `/projects/${id}/video`;
+
+      setVideoUrl(
+        relativeVideoUrl.startsWith("http")
+          ? relativeVideoUrl
+          : `${apiBase()}${relativeVideoUrl}`,
       );
 
-      if (data.status === "completed") {
-        setRenderStatus("completed");
+      setStatusMessage("Video rendering completed.");
+      setIsProcessing(false);
+      return;
+    }
 
-        const relativeVideoUrl =
-          data.video_url || `/projects/${id}/video`;
-
-        setVideoUrl(
-          relativeVideoUrl.startsWith("http")
-            ? relativeVideoUrl
-            : `${apiBase()}${relativeVideoUrl}`,
-        );
-
-        setStatusMessage("Video rendering completed.");
-        setIsProcessing(false);
-        return;
-      }
-
-      if (data.status === "failed") {
-        setRenderStatus("failed");
-        setRenderError(
-          data.error || "Video rendering failed.",
-        );
-        setStatusMessage("");
-        setIsProcessing(false);
-        return;
-      }
-
-      setRenderStatus("rendering");
-      setStatusMessage("Rendering video...");
-
-      pollTimer.current = setTimeout(
-        () => void pollRenderStatus(id),
-        3000,
-      );
-    } catch (pollError) {
+    if (data.status === "failed") {
       setRenderStatus("failed");
       setRenderError(
-        pollError instanceof Error
-          ? pollError.message
-          : "Could not check render status.",
+        data.error || "Video rendering failed.",
       );
+      setStatusMessage("");
       setIsProcessing(false);
+      return;
     }
+
+    // Still rendering
+    setRenderStatus("rendering");
+    setStatusMessage("Rendering video...");
+
+    pollTimer.current = setTimeout(
+      () => void pollRenderStatus(id),
+      3000,
+    );
+  } catch (pollError) {
+    /*
+     * IMPORTANT:
+     * A temporary network failure must NOT be treated
+     * as a rendering failure.
+     *
+     * Render continues on the backend even if this
+     * frontend request temporarily fails.
+     */
+    console.warn(
+      "Render status check failed temporarily:",
+      pollError,
+    );
+
+    setRenderStatus("rendering");
+    setStatusMessage(
+      "Connection interrupted. Checking render status again...",
+    );
+
+    pollTimer.current = setTimeout(
+      () => void pollRenderStatus(id),
+      5000,
+    );
   }
+}
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
