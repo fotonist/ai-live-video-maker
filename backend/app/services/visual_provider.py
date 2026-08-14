@@ -1,114 +1,183 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
 from app.services.scene_planner import Scene
 
 
-_LIGHTING_COLORS = {
-    "ambient_stage_glow": (14, 18, 38),
-    "concert_wash": (18, 10, 42),
-    "dynamic_beams": (8, 16, 46),
-    "dramatic_backlight": (34, 8, 28),
-    "fade_to_stage_black": (5, 7, 14),
-}
+_OPENAI_IMAGES_URL = "https://api.openai.com/v1/images/generations"
+_IMAGE_MODEL = os.getenv("AI_IMAGE_MODEL", "gpt-image-1")
+_IMAGE_QUALITY = os.getenv("AI_IMAGE_QUALITY", "low")
+_SCENE_IMAGE_LIMIT = max(1, int(os.getenv("AI_SCENE_IMAGE_LIMIT", "12")))
 
 
-def _hex_rgb(rgb: tuple[int, int, int]) -> str:
-    return "0x{:02x}{:02x}{:02x}".format(*rgb)
+def _visual_root() -> Path:
+    root = Path(os.getenv("UPLOAD_ROOT", "uploads")) / "generated_visuals"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
-def _background(scene: Scene) -> str:
-    base = _LIGHTING_COLORS.get(scene.lighting, (12, 16, 34))
-    lift = int(max(0.0, min(1.0, float(scene.energy))) * 14)
-    rgb = tuple(min(255, value + lift) for value in base)
-    return _hex_rgb(rgb)
+def _energy_label(energy: float) -> str:
+    value = max(0.0, min(1.0, float(energy)))
+    if value >= 0.78:
+        return "high-energy"
+    if value >= 0.48:
+        return "mid-energy"
+    return "low-energy"
 
 
-def _scene_filter(scene: Scene, width: int, height: int, index: int) -> str:
-    duration = max(scene.end - scene.start, 0.1)
-    energy = max(0.0, min(1.0, float(scene.energy)))
+def _scene_prompt(scene: Scene) -> str:
+    shot = str(scene.shot or "wide_stage").replace("_", " ")
+    lighting = str(scene.lighting or "concert_wash").replace("_", " ")
+    energy = _energy_label(scene.energy)
 
-    # Keep the generated scene lightweight enough for Render while making it
-    # read as a cinematic concert stage rather than a geometric placeholder.
-    beam_width = max(70, int(width * (0.045 + energy * 0.055)))
-    stage_y = int(height * 0.72)
-    stage_h = max(1, height - stage_y)
+    framing = {
+        "wide_stage": "wide cinematic shot showing the full stage and audience",
+        "medium": "medium cinematic shot of the performer on stage",
+        "close_up": "intimate close-up of the performer singing into a microphone",
+        "extreme_close_up": "dramatic extreme close-up of the performer during the performance",
+    }.get(str(scene.shot), f"cinematic {shot} framing")
 
-    performer_w = int(width * (0.09 if scene.shot == "wide_stage" else 0.13))
-    performer_h = int(height * (0.34 if scene.shot == "wide_stage" else 0.42))
-    performer_x = f"(iw-{performer_w})/2+sin(t*0.45+{index})*{int(width*0.045)}"
-    performer_y = f"ih-{performer_h}-ih*0.10"
+    return (
+        "Photorealistic live music concert photography, not illustration, not CGI, not vector art. "
+        "A professional male singer performing passionately on a large modern concert stage, "
+        f"{framing}. "
+        f"Lighting: {lighting}, with cinematic blue, violet and magenta stage lights. "
+        f"Mood: {energy}, emotionally expressive live performance, realistic audience silhouettes, "
+        "realistic skin, clothing and stage equipment, volumetric light beams, atmospheric haze, "
+        "shallow depth of field where appropriate, high-end music video cinematography, "
+        "natural photographic detail. Vertical 9:16 composition. No text, no logos, no watermark."
+    )
 
-    head = max(32, int(performer_w * 0.42))
-    head_x = f"({performer_x})+({performer_w}-{head})/2"
-    head_y = f"({performer_y})-{head+10}"
 
-    torso_w = max(1, int(performer_w * 0.62))
-    torso_x = f"({performer_x})+({performer_w}-{torso_w})/2"
-    torso_y = f"({performer_y})+{int(performer_h*0.18)}"
-    torso_h = max(1, int(performer_h*0.62))
+def _request_image(prompt: str, destination: Path) -> None:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not configured. Add an OpenAI API key to the Render service environment."
+        )
 
-    arm_w = max(12, int(performer_w * 0.25))
-    arm_h = max(12, int(performer_h * 0.10))
-    leg_w = max(12, int(performer_w * 0.20))
-    leg_h = max(20, int(performer_h * 0.34))
+    payload = {
+        "model": _IMAGE_MODEL,
+        "prompt": prompt,
+        "size": "1024x1536",
+        "quality": _IMAGE_QUALITY,
+    }
+    request = Request(
+        _OPENAI_IMAGES_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
 
-    beam_blue = "0x3158d4"
-    beam_purple = "0x8d3f91"
-    accent = "0xf04b76"
-    performer = "0xe7e7ed"
-    performer_shadow = "0xbfc1cf"
-    stage = "0x0c0d15"
-    audience = "0x05060b"
-    floor_light = "0x24366e"
+    try:
+        with urlopen(request, timeout=180) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"AI image generation failed ({exc.code}): {detail[:1000]}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"AI image generation network error: {exc}") from exc
 
-    chain = [
-        f"color=c={_background(scene)}:s={width}x{height}:r=8:d={duration:.3f}",
+    items = body.get("data") or []
+    if not items or not items[0].get("b64_json"):
+        raise RuntimeError("AI image generation returned no image data.")
 
-        # Soft-looking vertical stage washes built from broad translucent bands.
-        f"drawbox=x='mod(t*{width*0.10:.2f},iw+{beam_width*2})-{beam_width*2}':y=0:w={beam_width*2}:h=ih*0.86:color={beam_blue}@0.18:t=fill",
-        f"drawbox=x='iw-mod(t*{width*0.07:.2f},iw+{beam_width*2})':y=0:w={beam_width*2}:h=ih*0.86:color={beam_purple}@0.16:t=fill",
-        f"drawbox=x='iw*0.48+sin(t*0.35)*iw*0.16':y=0:w={beam_width}:h=ih*0.78:color={accent}@0.15:t=fill",
+    destination.write_bytes(base64.b64decode(items[0]["b64_json"]))
 
-        # Stage architecture.
-        f"drawbox=x=0:y={stage_y}:w=iw:h={stage_h}:color={stage}:t=fill",
-        f"drawbox=x=iw*0.08:y='ih*0.70':w=iw*0.84:h='ih*0.025':color={floor_light}@0.75:t=fill",
-        f"drawbox=x=iw*0.16:y='ih*0.735':w=iw*0.68:h='ih*0.008':color={accent}@0.9:t=fill",
 
-        # Moving spotlights.
-        f"drawbox=x='iw*0.20+sin(t*0.8)*iw*0.12':y='ih*0.05':w={beam_width}:h='ih*0.67':color={beam_blue}@0.22:t=fill",
-        f"drawbox=x='iw*0.72+sin(t*0.65+1.4)*iw*0.10':y='ih*0.05':w={beam_width}:h='ih*0.67':color={accent}@0.18:t=fill",
+def _cached_image(prompt: str) -> Path:
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:24]
+    destination = _visual_root() / f"scene_{digest}.png"
+    if destination.exists() and destination.stat().st_size > 1024:
+        return destination
 
-        # Audience silhouettes, intentionally small and low in frame.
-        "drawbox=x=iw*0.04:y='ih*0.79':w='iw*0.10':h='ih*0.11':color=" + audience + ":t=fill",
-        "drawbox=x=iw*0.17:y='ih*0.81':w='iw*0.08':h='ih*0.09':color=" + audience + ":t=fill",
-        "drawbox=x=iw*0.28:y='ih*0.80':w='iw*0.09':h='ih*0.10':color=" + audience + ":t=fill",
-        "drawbox=x=iw*0.63:y='ih*0.80':w='iw*0.09':h='ih*0.10':color=" + audience + ":t=fill",
-        "drawbox=x=iw*0.75:y='ih*0.81':w='iw*0.08':h='ih*0.09':color=" + audience + ":t=fill",
-        "drawbox=x=iw*0.86:y='ih*0.79':w='iw*0.10':h='ih*0.11':color=" + audience + ":t=fill",
+    temporary = destination.with_suffix(".png.part")
+    if temporary.exists():
+        temporary.unlink()
 
-        # Central performer: head, torso, raised arms and legs.
-        f"drawbox=x='{head_x}':y='{head_y}':w={head}:h={head}:color={performer}:t=fill",
-        f"drawbox=x='{torso_x}':y='{torso_y}':w={torso_w}:h={torso_h}:color={performer}:t=fill",
-        f"drawbox=x='({torso_x})-{arm_w}':y='({torso_y})+{int(torso_h*0.08)}':w={arm_w}:h={arm_h}:color={performer_shadow}:t=fill",
-        f"drawbox=x='({torso_x})+{torso_w}':y='({torso_y})+{int(torso_h*0.08)}':w={arm_w}:h={arm_h}:color={performer_shadow}:t=fill",
-        f"drawbox=x='({torso_x})+{int(torso_w*0.10)}':y='({torso_y})+{torso_h}':w={leg_w}:h={leg_h}:color={performer_shadow}:t=fill",
-        f"drawbox=x='({torso_x})+{torso_w}-{leg_w-int(performer_w*0.02)}':y='({torso_y})+{torso_h}':w={leg_w}:h={leg_h}:color={performer_shadow}:t=fill",
+    _request_image(prompt, temporary)
+    temporary.replace(destination)
+    return destination
 
-        # Animated light rail across the stage.
-        "drawbox=x='iw*0.10+sin(t*1.1)*iw*0.04':y='ih*0.665':w='iw*0.80':h='ih*0.008':color=" + accent + ":t=fill",
-        "format=yuv420p",
-    ]
 
-    return f"{','.join(chain)}[v{index}]"
+def _unique_scene_indices(scenes: list[Scene]) -> dict[int, int]:
+    """Map scenes to a small number of visual beats to control API cost."""
+    groups: dict[tuple[str, str, str], int] = {}
+    mapping: dict[int, int] = {}
+
+    for index, scene in enumerate(scenes):
+        energy = float(scene.energy)
+        key = (
+            str(scene.shot or "wide_stage"),
+            str(scene.lighting or "concert_wash"),
+            _energy_label(energy),
+        )
+        if key not in groups and len(groups) < _SCENE_IMAGE_LIMIT:
+            groups[key] = len(groups)
+        mapping[index] = groups.get(key, index % max(1, len(groups)))
+
+    return mapping
+
+
+def _escape_movie_path(path: Path) -> str:
+    # FFmpeg filter syntax needs backslashes for special characters. Render
+    # paths are normally simple Linux paths, but escaping makes this robust.
+    return str(path.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _scene_filter(scene: Scene, image: Path, width: int, height: int, index: int) -> str:
+    duration = max(float(scene.end) - float(scene.start), 0.1)
+    movie_path = _escape_movie_path(image)
+
+    # Repeat the generated still for the scene duration and apply a subtle
+    # Ken Burns movement. This creates motion without asking the image model
+    # to generate a full video clip for every scene.
+    frames = max(1, int(duration * 8))
+    zoom_direction = "1" if index % 2 == 0 else "-1"
+    x_motion = f"(iw-ow)/2+sin(t*0.22+{index})*(iw-ow)*0.12*{zoom_direction}"
+    y_motion = f"(ih-oh)/2+cos(t*0.18+{index})*(ih-oh)*0.08"
+
+    return (
+        f"movie='{movie_path}':loop=1,"
+        f"scale={int(width * 1.12)}:{int(height * 1.12)}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height}:x='{x_motion}':y='{y_motion}',"
+        f"trim=duration={duration:.3f},setpts=PTS-STARTPTS,"
+        f"fps=8,format=yuv420p[v{index}]"
+    )
 
 
 def build_visual_filter(scenes: list[Scene], width: int, height: int) -> str:
-    """Build a lightweight animated concert-stage visual from the scene plan."""
+    """Generate photorealistic AI scene images and build the FFmpeg filter."""
     if not scenes:
         raise ValueError("Cannot build visual filter without scenes")
 
+    mapping = _unique_scene_indices(scenes)
+    images: dict[int, Path] = {}
+    generated = 0
+
+    for index, scene in enumerate(scenes):
+        group = mapping[index]
+        if group in images:
+            continue
+
+        prompt = _scene_prompt(scene)
+        images[group] = _cached_image(prompt)
+        generated += 1
+        print(f"[visual] AI image {generated} ready for visual beat {group + 1}", flush=True)
+
     parts = [
-        _scene_filter(scene, width, height, index)
+        _scene_filter(scene, images[mapping[index]], width, height, index)
         for index, scene in enumerate(scenes)
     ]
     concat_inputs = "".join(f"[v{index}]" for index in range(len(scenes)))
