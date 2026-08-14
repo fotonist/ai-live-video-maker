@@ -43,11 +43,13 @@ def _render(job_dir: Path) -> None:
     if image is None or audio is None:
         raise RuntimeError("Motion test assets are missing")
 
-    visual = job_dir / "visual.mp4"
     final = job_dir / "video.mp4"
     width, height = 1080, 1920
     movie_path = str(image.resolve()).replace("\\", "/").replace("'", "\\'")
 
+    # Keep the whole render in one FFmpeg process. The previous two-pass
+    # approach could create an MP4 container that existed on disk but exposed
+    # no readable video stream to the second FFmpeg invocation.
     visual_filter = (
         f"movie='{movie_path}':loop=1,"
         f"scale={int(width * 1.18)}:{int(height * 1.18)}:force_original_aspect_ratio=increase,"
@@ -59,31 +61,40 @@ def _render(job_dir: Path) -> None:
 
     _run(
         [
-            ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-filter_complex", visual_filter,
-            "-map", "[v]", "-t", str(DURATION),
-            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(visual),
+            ffmpeg,
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(audio),
+            "-filter_complex",
+            visual_filter,
+            "-map",
+            "[v]",
+            "-map",
+            "0:a:0",
+            "-t",
+            str(DURATION),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "26",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(final),
         ],
-        "motion visual",
-    )
-
-    if not visual.exists() or visual.stat().st_size == 0:
-        raise RuntimeError("Motion visual was not created")
-
-    # Re-encode the video during mux instead of stream-copying it. This avoids
-    # failures when FFmpeg cannot see the generated visual stream as 0:v:0.
-    _run(
-        [
-            ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-i", str(visual), "-i", str(audio),
-            "-map", "0:v", "-map", "1:a:0",
-            "-t", str(DURATION),
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-            "-shortest", "-movflags", "+faststart", str(final),
-        ],
-        "audio mux",
+        "motion video + audio",
     )
 
     if not final.exists() or final.stat().st_size == 0:
@@ -156,12 +167,21 @@ def motion_test_status(job_id: UUID) -> MotionTestResponse:
     status_file = job_dir / "status.txt"
     status = status_file.read_text(encoding="utf-8").strip() if status_file.exists() else "queued"
     if status == "completed":
-        return MotionTestResponse(id=job_id, status=status, message="Motion test completed.", video_url=f"/motion-test/{job_id}/video")
+        return MotionTestResponse(
+            id=job_id,
+            status=status,
+            message="Motion test completed.",
+            video_url=f"/motion-test/{job_id}/video",
+        )
     if status == "failed":
         error_file = job_dir / "error.txt"
         error = error_file.read_text(encoding="utf-8") if error_file.exists() else "Motion test failed."
         return MotionTestResponse(id=job_id, status=status, message="Motion test failed.", error=error)
-    return MotionTestResponse(id=job_id, status=status, message="Creating a moving shot from the uploaded image...")
+    return MotionTestResponse(
+        id=job_id,
+        status=status,
+        message="Creating a moving shot from the uploaded image...",
+    )
 
 
 @router.get("/{job_id}/video")
