@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
+import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -14,7 +16,6 @@ router = APIRouter(prefix="/singing-test", tags=["singing-test"])
 ROOT = Path("uploads") / "singing-tests"
 MAX_IMAGE_SIZE = 15 * 1024 * 1024
 MAX_AUDIO_SIZE = 5 * 1024 * 1024
-
 KLING_BASE_URL = "https://api.klingai.com/v1"
 
 
@@ -35,15 +36,12 @@ def _api_key() -> str:
 
 
 def _headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {_api_key()}",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"}
 
 
 def _write_status(job_dir: Path, status: str, phase: str, message: str = "") -> None:
     (job_dir / "status.json").write_text(
-        __import__("json").dumps({"status": status, "phase": phase, "message": message}),
+        json.dumps({"status": status, "phase": phase, "message": message}),
         encoding="utf-8",
     )
 
@@ -52,7 +50,7 @@ def _read_status(job_dir: Path) -> dict[str, str]:
     path = job_dir / "status.json"
     if not path.exists():
         return {"status": "queued", "phase": "queued", "message": "Queued."}
-    return __import__("json").loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _extract_task_id(payload: dict) -> str:
@@ -101,8 +99,6 @@ def _kling_get(path: str) -> dict:
 
 
 def _poll_task(path: str, job_dir: Path, phase: str, timeout_seconds: int = 600) -> dict:
-    import time
-
     started = time.monotonic()
     while time.monotonic() - started < timeout_seconds:
         payload = _kling_get(path)
@@ -127,13 +123,10 @@ def _run(job_id: UUID) -> None:
         image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
         audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
 
-        # Kling's image-to-video task creates the 5/10 second face/performance
-        # video first. Lip Sync then uses the generated Kling video_id and the
-        # original singing audio to drive the mouth movements.
         i2v = _kling_post(
             "/videos/image2video",
             {
-                "model_name": os.getenv("KLING_VIDEO_MODEL", "kling-v2-6"),
+                "model_name": os.getenv("KLING_VIDEO_MODEL", "kling-v1-6"),
                 "image": image_b64,
                 "prompt": (
                     "A realistic live music performance. The singer performs naturally for the camera, "
